@@ -1,0 +1,1 @@
+"""MorningTalk transcription application."""
