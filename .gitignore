@@ -45,6 +45,11 @@ build/
 *.pdf
 Transcript/
 transcripts/
+previews/
+reviews/
+*.phase9.json
+*.phase10.json
+*.transcript.json
 models/
 fonts/*.ttf
 *.tmp

@@ -17,6 +17,11 @@ SUPPORTED_TRANSCRIPTION_API_VERSIONS = {
     "2025-03-01-preview",
     "v1",
 }
+DEFAULT_AZURE_OPENAI_API_VERSION = "v1"
+
+
+def get_azure_openai_api_version() -> str:
+    return os.getenv("AZURE_OPENAI_API_VERSION", "").strip() or DEFAULT_AZURE_OPENAI_API_VERSION
 
 
 @dataclass(frozen=True)

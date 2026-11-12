@@ -425,3 +425,39 @@ def test_configuration_reads_transcription_and_text_settings_separately(monkeypa
     assert config.transcription_api_key == values["AZURE_TRANSCRIPTION_API_KEY"]
     assert config.transcription_deployment == values["AZURE_TRANSCRIPTION_DEPLOYMENT"]
     assert config.transcription_api_version == values["AZURE_TRANSCRIPTION_API_VERSION"]
+
+
+def test_configuration_preserves_full_responses_url_and_separate_transcription_config(monkeypatch):
+    endpoint = (
+        "https://text.example.test/openai/responses"
+        "?api-version=2025-04-01-preview"
+    )
+    transcription = {
+        "AZURE_TRANSCRIPTION_ENDPOINT": "https://speech.example.test",
+        "AZURE_TRANSCRIPTION_API_KEY": "transcription-only-key",
+        "AZURE_TRANSCRIPTION_DEPLOYMENT": "gpt-4o-transcribe",
+        "AZURE_TRANSCRIPTION_API_VERSION": "2025-03-01-preview",
+    }
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", endpoint)
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "gpt-only-key")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.4-mini")
+    for name, value in transcription.items():
+        monkeypatch.setenv(name, value)
+
+    config = config_module.get_azure_config()
+
+    assert config.text_endpoint == endpoint
+    assert config.text_api_key == "gpt-only-key"
+    assert config.text_deployment == "gpt-5.4-mini"
+    assert config.transcription_endpoint == transcription["AZURE_TRANSCRIPTION_ENDPOINT"]
+    assert config.transcription_api_key == transcription["AZURE_TRANSCRIPTION_API_KEY"]
+    assert config.transcription_deployment == transcription["AZURE_TRANSCRIPTION_DEPLOYMENT"]
+    assert config.transcription_api_version == transcription["AZURE_TRANSCRIPTION_API_VERSION"]
+
+
+def test_openai_text_api_defaults_to_v1_without_changing_transcription_version(monkeypatch):
+    monkeypatch.delenv("AZURE_OPENAI_API_VERSION", raising=False)
+    monkeypatch.setenv("AZURE_TRANSCRIPTION_API_VERSION", "2025-03-01-preview")
+
+    assert config_module.get_azure_openai_api_version() == "v1"
+    assert config_module.get_azure_openai_api_version() != config_module.get_azure_config().transcription_api_version

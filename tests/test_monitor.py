@@ -87,6 +87,109 @@ def test_monitor_lock_prevents_a_second_live_instance(tmp_path: Path):
     assert not lock.exists()
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        Path("CB") / "Dec26" / "meeting.mp3",
+        Path("CB") / "Jan27" / "meeting.mp3",
+        Path("CB") / "2027" / "Jan" / "meeting.mp3",
+        Path("CB") / "2027" / "Feb" / "meeting.mp3",
+        Path("arbitrary") / "nesting" / "depth" / "meeting.mp3",
+    ],
+)
+def test_scanner_discovers_calendar_and_arbitrarily_nested_folders(
+    tmp_path: Path, monkeypatch, relative_path: Path,
+):
+    root = tmp_path / "Record File"
+    source = root / relative_path
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"audio")
+    monkeypatch.setattr("app.scanner.is_file_stable", lambda *_args: True)
+
+    items = scan_directory(root, stability_interval_seconds=0)
+
+    assert [item.path for item in items] == [source]
+    assert items[0].pdf_path == source.with_suffix(".pdf")
+
+
+def test_same_mp3_basename_in_different_folders_is_tracked_by_full_path(
+    tmp_path: Path, monkeypatch,
+):
+    root = tmp_path / "Record File"
+    sources = [root / folder / "meeting.mp3" for folder in ("first", "second")]
+    for source in sources:
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"audio")
+    monkeypatch.setattr("app.scanner.is_file_stable", lambda *_args: True)
+
+    items = scan_directory(root, stability_interval_seconds=0)
+
+    assert [item.path for item in items] == sorted(sources)
+    assert len({str(item.path.resolve()).casefold() for item in items}) == 2
+    assert all(item.pdf_path == item.path.with_suffix(".pdf") for item in items)
+
+
+def test_monitor_scan_discovers_folder_created_after_monitor_start(
+    tmp_path: Path, monkeypatch,
+):
+    root = tmp_path / "Record File"
+    root.mkdir()
+    monkeypatch.setattr("app.scanner.is_file_stable", lambda *_args: True)
+
+    assert scan_directory(root, stability_interval_seconds=0) == []
+
+    source = root / "CB" / "Dec26" / "new.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"new audio")
+    assert [item.path for item in scan_directory(root, stability_interval_seconds=0)] == [source]
+
+
+def test_partially_copied_mp3_is_marked_unstable_and_not_synchronized(
+    tmp_path: Path, monkeypatch,
+):
+    root = tmp_path / "Record File"
+    source = root / "nested" / "copy.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"partial")
+    monkeypatch.setattr("app.scanner.is_file_stable", lambda *_args: False)
+    repository = Mock()
+
+    items = scan_directory(root, stability_interval_seconds=0)
+    results = synchronize_scan(items, repository)
+
+    assert results[0][2] == "unstable"
+    repository.upsert_scan.assert_not_called()
+
+
+def test_missing_input_root_fails_instead_of_appearing_empty(tmp_path: Path):
+    missing_root = tmp_path / "missing"
+
+    with pytest.raises(FileNotFoundError):
+        scan_directory(missing_root)
+
+
+def test_monitor_retries_after_temporary_database_failure(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    calls = []
+
+    def scan_cycle(_input_dir, **_options):
+        calls.append(None)
+        if len(calls) == 1:
+            raise ConnectionError("temporary database outage")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("app.monitor.time.sleep", lambda _seconds: None)
+    assert run_monitor(scan_cycle, tmp_path, interval_seconds=1) == 0
+    assert len(calls) == 2
+    log_text = (tmp_path / "MorningTalk" / "logs" / "monitor.log").read_text(
+        encoding="utf-8"
+    )
+    assert "error_class=ConnectionError" in log_text
+    assert "temporary database outage" not in log_text
+
+
 def test_new_mp3_is_queued_in_database_and_existing_pdf_is_untouched(
     tmp_path: Path, monkeypatch,
 ):

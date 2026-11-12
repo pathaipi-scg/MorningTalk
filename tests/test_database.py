@@ -7,11 +7,14 @@ import pytest
 
 from app.config import SqlConfig
 from app.database import SqlRepository, connect_sql, retry_delay_seconds
+from app.meeting_analysis import AnalysisItem, EvidenceReference, MeetingAnalysis
+from app.meeting_outputs import MeetingPdfOutputs, PdfOutputStatus
 from app.scanner import classify_scanned_file, scan_directory
 from app.database import AudioRecord
 from app.auto_scan import process_scanned_file
 from app.scanner import ScannedAudio
 import app.auto_scan as auto_scan_module
+from app.transcript import TranscriptDocument, TranscriptSegment
 
 
 def make_sql_config(**overrides):
@@ -80,12 +83,172 @@ def test_claim_without_eligible_record_returns_none():
     assert repository.claim_file(17, uuid.uuid4()) is None
 
 
+def test_restart_recovery_expires_exhausted_processing_leases():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.rowcount = 1
+    repository = SqlRepository(connection)
+
+    assert repository.recover_expired_leases() == 1
+
+    query = cursor.execute.call_args.args[0]
+    assert "Status = 'processing'" in query
+    assert "LeaseExpiresUtc <= SYSUTCDATETIME()" in query
+    assert "AttemptCount >= ?" in query
+    assert cursor.execute.call_args.args[1] == 3
+    connection.commit.assert_called_once()
+
+
 def test_retry_delay_is_exponential_and_capped():
     assert retry_delay_seconds(1) == 60
     assert retry_delay_seconds(2) == 120
     assert retry_delay_seconds(10) == 3600
     with pytest.raises(ValueError):
         retry_delay_seconds(0)
+
+
+def test_phase9_schema_preflight_is_read_only():
+    connection = Mock()
+    connection.cursor.return_value.fetchone.return_value = (1,)
+    repository = SqlRepository(connection)
+
+    assert repository.phase9_schema_ready()
+    assert "COL_LENGTH" in connection.cursor.return_value.execute.call_args.args[0]
+    connection.commit.assert_not_called()
+
+
+def test_phase9_transcript_persistence_keeps_raw_cleaned_and_segments_separate():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.rowcount = 1
+    repository = SqlRepository(connection)
+    document = TranscriptDocument(
+        (
+            TranscriptSegment(
+                1.0, 2.0, "Speaker A", "raw Lot 123", "clean Lot 123"
+            ),
+        ),
+        "available",
+        "completed",
+        input_tokens=12,
+        output_tokens=5,
+    )
+
+    repository.save_phase9_transcript(17, document)
+
+    update = cursor.execute.call_args_list[0]
+    assert "RawTranscript = ?" in update.args[0]
+    assert update.args[1] == "raw Lot 123"
+    assert update.args[2] == "clean Lot 123"
+    assert '"raw_text":"raw Lot 123"' in update.args[3]
+    assert "INSERT INTO dbo.ProcessingLog" in cursor.execute.call_args_list[1].args[0]
+    assert "raw Lot 123" not in cursor.execute.call_args_list[1].args[-1]
+    connection.commit.assert_called_once()
+
+
+def test_phase9_output_statuses_are_persisted_independently():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.rowcount = 1
+    repository = SqlRepository(connection)
+    transcript = TranscriptDocument(
+        (TranscriptSegment(1, 2, "Speaker A", "raw", "clean"),),
+        "available",
+        "completed",
+    )
+    analysis = MeetingAnalysis(
+        AnalysisItem("overview", (EvidenceReference(1, "clean"),)),
+        (), (), (), (), (), (), "validated",
+    )
+    outputs = MeetingPdfOutputs(
+        PdfOutputStatus(Path("meeting.pdf"), "created"),
+        PdfOutputStatus(Path("meeting_Full.pdf"), "existing"),
+    )
+
+    repository.save_phase9_outputs(17, transcript, analysis, outputs)
+
+    update = cursor.execute.call_args_list[0]
+    assert "SummaryPdfStatus = ?" in update.args[0]
+    assert "FullTranscriptPdfStatus = ?" in update.args[0]
+    assert update.args[11:15] == (
+        "meeting.pdf", "created", "meeting_Full.pdf", "existing",
+    )
+    assert len(cursor.execute.call_args_list) == 4
+    connection.commit.assert_called_once()
+
+
+def test_review_required_content_marks_pdf_statuses_independently():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.rowcount = 1
+    repository = SqlRepository(connection)
+    transcript = TranscriptDocument(
+        (TranscriptSegment(None, None, None, "raw", review_required=True),),
+        "unavailable",
+        "review_required",
+        "HTTP404",
+    )
+    analysis = MeetingAnalysis.for_review("TranscriptCleanupRequiresReview")
+    outputs = MeetingPdfOutputs(
+        PdfOutputStatus(Path("summary.pdf"), "created"),
+        PdfOutputStatus(Path("full.pdf"), "created"),
+    )
+
+    repository.save_phase9_outputs(17, transcript, analysis, outputs)
+
+    update = cursor.execute.call_args_list[0]
+    assert update.args[12] == "review_required"
+    assert update.args[14] == "review_required"
+    output_log_statuses = [
+        call.args[3]
+        for call in cursor.execute.call_args_list[1:3]
+    ]
+    assert output_log_statuses == ["review_required", "review_required"]
+    connection.commit.assert_called_once()
+
+
+def test_review_required_summary_does_not_demote_valid_full_transcript():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.rowcount = 1
+    repository = SqlRepository(connection)
+    transcript = TranscriptDocument(
+        (TranscriptSegment(1, 2, "Speaker A", "raw", "clean"),),
+        "available",
+        "completed",
+    )
+    analysis = MeetingAnalysis.for_review("AnalysisNotValidated")
+    outputs = MeetingPdfOutputs(
+        PdfOutputStatus(Path("summary.pdf"), "created"),
+        PdfOutputStatus(Path("full.pdf"), "created"),
+    )
+
+    repository.save_phase9_outputs(17, transcript, analysis, outputs)
+
+    update = cursor.execute.call_args_list[0]
+    assert update.args[12] == "review_required"
+    assert update.args[14] == "created"
+
+
+
+
+
+def test_saved_transcript_loader_reads_only_requested_audio_id():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.fetchone.return_value = (
+        4, r"D:\meeting.mp3", "fingerprint", "review_required",
+        "saved transcript", "[]", "unavailable", None, None,
+    )
+    repository = SqlRepository(connection)
+
+    record = repository.load_saved_transcript(4)
+
+    assert record is not None
+    assert record.audio_file_id == 4
+    assert record.raw_transcript == "saved transcript"
+    assert "WHERE AudioFileId = ?" in cursor.execute.call_args.args[0]
+    assert cursor.execute.call_args.args[1] == 4
 
 
 @pytest.mark.parametrize(
@@ -139,6 +302,9 @@ def test_failed_processing_does_not_publish_pdf(tmp_path: Path, monkeypatch):
     repository.claim_file.return_value = 1
     transcriber = Mock()
     transcriber.transcribe.side_effect = RuntimeError("failure")
+    monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "test-version")
+    monkeypatch.delenv("AZURE_SPEECH_ENDPOINT", raising=False)
+    monkeypatch.delenv("AZURE_SPEECH_KEY", raising=False)
     monkeypatch.setattr(
         auto_scan_module,
         "AzureOpenAITranscriber",
