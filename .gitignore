@@ -47,6 +47,8 @@ Transcript/
 transcripts/
 previews/
 reviews/
+/reports/benchmark/
+/workspace/
 *.phase9.json
 *.phase10.json
 *.transcript.json

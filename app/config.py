@@ -14,7 +14,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 DEFAULT_INPUT_DIR = Path(r"D:\KM\Vault\MorningTalk\Record File")
 SUPPORTED_TRANSCRIPTION_API_VERSIONS = {
     "2024-02-01",
+    "2024-10-21",
     "2025-03-01-preview",
+    "2025-04-01-preview",
     "v1",
 }
 DEFAULT_AZURE_OPENAI_API_VERSION = "v1"

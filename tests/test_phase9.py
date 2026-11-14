@@ -12,6 +12,7 @@ from app.config import AzureConfig
 from app.pdf_export import write_transcript_pdf
 from app.transcript import (
     TranscriptDocument,
+    TranscriptQualityFinding,
     TranscriptSegment,
     canonical_speaker_labels,
     number_code_mismatch,
@@ -20,6 +21,7 @@ from app.transcript import (
 )
 from app.transcript_cleanup import TranscriptCleanup
 from app.transcript_cleanup import _split_cleanup_text
+from app.factory_context import load_factory_vocabulary
 import app.transcriber as transcriber_module
 
 
@@ -165,6 +167,139 @@ def test_cleanup_corrects_thai_while_preserving_speaker_timestamp_numbers():
     assert document.input_tokens == 70
     assert document.output_tokens == 15
     assert session.post.call_args.kwargs["params"] == {"api-version": "2025-04-01-preview"}
+    prompt = session.post.call_args.kwargs["json"]["messages"][1]["content"]
+    assert "ห้ามสรุปหรือเขียนใหม่เป็นรายงานประชุม" in prompt
+    assert "ห้ามแทนคำที่ไม่คุ้นด้วยคำโรงงานที่ฟังดูเป็นไปได้" in prompt
+    assert "Twinloader" in prompt
+    assert "Mechanical Seal" not in prompt
+
+
+def test_factory_vocabulary_is_editable_and_extensible(tmp_path):
+    vocabulary_path = tmp_path / "factory.json"
+    vocabulary_path.write_text(
+        json.dumps(
+            {
+                "context_th": "โรงงานผลิตกระเบื้อง",
+                "vocabulary": ["Press", "Custom Feeder"],
+                "suspicious_phrases": ["คำไม่ชัด"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    vocabulary = load_factory_vocabulary(vocabulary_path)
+
+    assert vocabulary.terms == ()
+    assert vocabulary.confirmed_terms == ()
+    assert tuple(entry.canonical_english for entry in vocabulary.entries) == (
+        "Press",
+        "Custom Feeder",
+        None,
+    )
+    assert vocabulary.suspicious_phrases == ("คำไม่ชัด",)
+
+
+def test_suspicious_factory_phrase_is_preserved_and_flagged_for_review():
+    raw_text = "วันนี้พ่อครับส่งงานที่ Press"
+    segment = TranscriptSegment(1, 2, "Speaker A", raw_text)
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "choices": [{
+            "message": {"content": json.dumps(
+                {"segments": [{"index": 0, "text": raw_text}]},
+                ensure_ascii=False,
+            )}
+        }]
+    }
+    session = Mock()
+    session.post.return_value = response
+
+    document = TranscriptCleanup(
+        azure_config(), api_version="v1", session=session
+    ).clean((segment,))
+
+    finding = document.segments[0].quality_findings[0]
+    assert document.segments[0].raw_text == raw_text
+    assert document.segments[0].cleaned_text == raw_text
+    assert document.segments[0].review_required
+    assert document.cleanup_status == "review_required"
+    assert finding == TranscriptQualityFinding(
+        "พ่อครับ", None, raw_text, "high", True
+    )
+
+
+def test_uncertain_speech_correction_is_recorded_but_requires_review():
+    raw_text = "ตรวจสอบทวินโอดเดอร์"
+    cleaned_text = "ตรวจสอบ Twin Loader"
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "choices": [{
+            "message": {"content": json.dumps(
+                {
+                    "segments": [{"index": 0, "text": cleaned_text}],
+                    "review_findings": [{
+                        "index": 0,
+                        "original_phrase": "ทวินโอดเดอร์",
+                        "proposed_correction": "Twin Loader",
+                        "context": raw_text,
+                        "uncertainty": "medium",
+                    }],
+                },
+                ensure_ascii=False,
+            )}
+        }]
+    }
+    session = Mock()
+    session.post.return_value = response
+
+    document = TranscriptCleanup(
+        azure_config(), api_version="v1", session=session
+    ).clean((TranscriptSegment(1, 2, None, raw_text),))
+
+    finding = document.segments[0].quality_findings[0]
+    assert finding.original_phrase == "ทวินโอดเดอร์"
+    assert finding.proposed_correction == "Twin Loader"
+    assert finding.surrounding_context == raw_text
+    assert finding.uncertainty == "medium"
+    assert finding.review_required
+    assert document.segments[0].cleaned_text == raw_text
+    assert document.cleanup_status == "review_required"
+
+
+def test_cleanup_keeps_proposed_correction_for_review_without_applying_it():
+    raw_text = "ตรวจสอบทวินโอดเดอร์"
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "choices": [{
+            "message": {"content": json.dumps(
+                {
+                    "segments": [{"index": 0, "text": raw_text}],
+                    "review_findings": [{
+                        "index": 0,
+                        "original_phrase": "ทวินโอดเดอร์",
+                        "proposed_correction": "Twin Loader",
+                        "context": raw_text,
+                        "uncertainty": "low",
+                    }],
+                },
+                ensure_ascii=False,
+            )}
+        }]
+    }
+    session = Mock()
+    session.post.return_value = response
+
+    document = TranscriptCleanup(
+        azure_config(), api_version="v1", session=session
+    ).clean((TranscriptSegment(1, 2, None, raw_text),))
+
+    assert document.cleanup_status == "review_required"
+    assert document.review_reason == "UncertainSpeechRequiresReview"
+    assert document.segments[0].raw_text == raw_text
+    assert document.segments[0].cleaned_text == raw_text
+    assert document.segments[0].review_required
+    assert document.segments[0].quality_findings[0].proposed_correction == "Twin Loader"
 
 
 def test_cleanup_v1_uses_deployment_model_without_dated_api_version():
@@ -242,7 +377,10 @@ def test_cleanup_uses_complete_responses_url_and_structured_json():
     )
     assert body["max_output_tokens"] == 16000
     assert body["text"]["format"]["type"] == "json_schema"
-    assert body["text"]["format"]["schema"]["required"] == ["segments"]
+    assert body["text"]["format"]["schema"]["required"] == [
+        "segments",
+        "review_findings",
+    ]
     assert "messages" not in body
     assert document.cleanup_status == "completed"
     assert (document.input_tokens, document.output_tokens) == (70, 15)
@@ -600,6 +738,7 @@ def test_existing_segmented_pdf_is_not_overwritten(tmp_path: Path):
 
 def test_fixture_preview_does_not_make_azure_calls(tmp_path: Path, monkeypatch):
     import app.phase9 as phase9
+    import app.meeting_outputs as meeting_outputs
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Fixture preview must be fully offline.")
@@ -607,6 +746,8 @@ def test_fixture_preview_does_not_make_azure_calls(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(phase9, "AzureSpeechDiarizer", forbidden)
     monkeypatch.setattr(phase9, "AzureOpenAITranscriber", forbidden)
     monkeypatch.setattr(phase9, "TranscriptCleanup", forbidden)
+    monkeypatch.setattr(meeting_outputs, "DEFAULT_PREVIEW_ROOT", tmp_path / "previews")
+    monkeypatch.setattr(meeting_outputs, "DEFAULT_TEMP_ROOT", tmp_path / "temp")
 
     summary = phase9.run_fixture_preview(tmp_path)
     full = summary.with_name(summary.name.replace("_Summary_Draft.pdf", "_Full.pdf"))

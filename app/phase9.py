@@ -22,6 +22,10 @@ from app.file_manager import (
     source_fingerprint,
     source_processing_lock,
 )
+from app.factory_context import (
+    normalize_transcript_segments,
+    normalization_enabled,
+)
 from app.meeting_analysis import (
     AnalysisItem,
     EvidenceReference,
@@ -34,15 +38,17 @@ from app.scanner import is_file_stable
 from app.transcriber import AzureOpenAITranscriber
 from app.transcript import (
     TranscriptDocument,
+    TranscriptQualityFinding,
     TranscriptSegment,
     mark_for_review,
     validate_segment_times,
 )
 from app.transcript_cleanup import TranscriptCleanup
+from app.workspace_paths import DEFAULT_PREVIEW_ROOT
 
 logger = logging.getLogger(__name__)
 TARGET_RECORDING = "meeting-20261107-0817.mp3"
-PREVIEW_DIRECTORY = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "MorningTalk" / "previews"
+PREVIEW_DIRECTORY = DEFAULT_PREVIEW_ROOT
 RESUME_AUDIO_FILE_ID = 4
 RESUME_PREVIEW_DIRECTORY = PREVIEW_DIRECTORY / "live-test-20261107-resume-v1"
 
@@ -139,7 +145,14 @@ def _write_document_json(
 ) -> None:
     payload = {
         "raw_transcript": document.raw_transcript,
+        "normalized_transcript": document.normalized_transcript,
         "cleaned_transcript": document.cleaned_transcript,
+        "normalization_records": [
+            asdict(item) for item in document.normalization_records
+        ],
+        "normalization_review_findings": list(
+            document.normalization_review_findings
+        ),
         "diarization_status": document.diarization_status,
         "cleanup_status": document.cleanup_status,
         "review_reason": document.review_reason,
@@ -186,8 +199,15 @@ def _run_controlled_live_test(
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path, full_path = meeting_pdf_paths(source)
     json_path = output_dir / f"{source.stem}.phase9.json"
+    use_terminology_pipeline = normalization_enabled()
     if json_path.exists():
         raise FileExistsError("Phase 9 JSON output already exists; choose a new output directory.")
+    if use_terminology_pipeline and (
+        output_dir / f"{source.stem}.terminology.json"
+    ).exists():
+        raise FileExistsError(
+            "Terminology stage output already exists; choose a new output directory."
+        )
 
     config = get_azure_config()
     cleanup_version = get_azure_openai_api_version()
@@ -258,25 +278,80 @@ def _run_controlled_live_test(
             segments = (TranscriptSegment(None, None, None, text),)
             diarization_status = "unavailable"
 
-        try:
-            cleaned = TranscriptCleanup(
-                config,
-                api_version=cleanup_version,
-            ).clean(segments)
-            document = TranscriptDocument(
-                cleaned.segments,
-                diarization_status,
-                cleaned.cleanup_status,
-                cleaned.review_reason,
-                cleaned.input_tokens,
-                cleaned.output_tokens,
+        raw_transcript = "\n".join(segment.raw_text for segment in segments)
+        normalization_records = ()
+        normalization_findings = ()
+        normalized_transcript = raw_transcript
+        cleanup_segments = segments
+        if use_terminology_pipeline:
+            normalization = normalize_transcript_segments(
+                segments,
+                recording=source.name,
             )
+            cleanup_segments = normalization.segments
+            normalized_transcript = normalization.normalized_transcript
+            normalization_records = normalization.replacements
+            normalization_findings = normalization.review_findings
+            normalized_path = output_dir / f"{source.stem}.terminology.json"
+            with normalized_path.open("x", encoding="utf-8") as normalized_file:
+                json.dump(
+                    {
+                        "source_filename": source.name,
+                        "source_fingerprint": source_fingerprint(source),
+                        "raw_transcript": normalization.raw_transcript,
+                        "normalized_transcript": normalization.normalized_transcript,
+                        "normalization_records": [
+                            asdict(item) for item in normalization.replacements
+                        ],
+                        "normalization_review_findings": list(
+                            normalization.review_findings
+                        ),
+                    },
+                    normalized_file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                normalized_file.write("\n")
+
+        try:
+            if normalization_findings:
+                document = mark_for_review(
+                    cleanup_segments,
+                    "TerminologyCandidatesRequireReview",
+                    diarization_status=diarization_status,
+                )
+            else:
+                cleaned = TranscriptCleanup(
+                    config,
+                    api_version=cleanup_version,
+                ).clean(cleanup_segments)
+                document = TranscriptDocument(
+                    cleaned.segments,
+                    diarization_status,
+                    cleaned.cleanup_status,
+                    cleaned.review_reason,
+                    cleaned.input_tokens,
+                    cleaned.output_tokens,
+                )
         except Exception as error:
             logger.error("Transcript cleanup unavailable; error_class=%s", type(error).__name__)
             document = mark_for_review(
-                segments,
+                cleanup_segments,
                 "CleanupUnavailable",
                 diarization_status=diarization_status,
+            )
+        if use_terminology_pipeline:
+            document = TranscriptDocument(
+                document.segments,
+                document.diarization_status,
+                document.cleanup_status,
+                document.review_reason,
+                document.input_tokens,
+                document.output_tokens,
+                raw_transcript_source=raw_transcript,
+                normalized_transcript_source=normalized_transcript,
+                normalization_records=normalization_records,
+                normalization_review_findings=normalization_findings,
             )
 
         if document.cleanup_status != "completed":
@@ -340,6 +415,29 @@ def _saved_transcript_document(record: SavedTranscriptRecord) -> TranscriptDocum
         cleaned_text = item.get("cleaned_text")
         if cleaned_text is not None and not isinstance(cleaned_text, str):
             raise ValueError("The saved transcript contains invalid cleaned text.")
+        raw_findings = item.get("quality_findings", [])
+        if not isinstance(raw_findings, list):
+            raise ValueError("The saved transcript contains invalid quality findings.")
+        findings = []
+        for finding in raw_findings:
+            if (
+                not isinstance(finding, dict)
+                or not isinstance(finding.get("original_phrase"), str)
+                or finding.get("proposed_correction") is not None
+                and not isinstance(finding.get("proposed_correction"), str)
+                or not isinstance(finding.get("surrounding_context"), str)
+                or not isinstance(finding.get("uncertainty"), str)
+                or finding.get("uncertainty") not in {"low", "medium", "high"}
+                or finding.get("review_required") is not True
+            ):
+                raise ValueError("The saved transcript contains invalid quality findings.")
+            findings.append(TranscriptQualityFinding(
+                finding["original_phrase"],
+                finding.get("proposed_correction"),
+                finding["surrounding_context"],
+                finding["uncertainty"],
+                True,
+            ))
         segments.append(TranscriptSegment(
             start,
             end,
@@ -347,6 +445,7 @@ def _saved_transcript_document(record: SavedTranscriptRecord) -> TranscriptDocum
             raw_text,
             cleaned_text,
             item["review_required"],
+            tuple(findings),
         ))
 
     transcript_segments = tuple(segments)
@@ -419,18 +518,40 @@ def run_controlled_transcript_resume(
                 previous_payload = json.loads(previous_json.read_text(encoding="utf-8"))
             except (OSError, ValueError) as error:
                 raise RuntimeError("The original Phase 9 JSON cannot be validated.") from error
+            previous_segments = previous_payload.get("segments")
+            segments_match = (
+                isinstance(previous_segments, list)
+                and len(previous_segments) == len(document.segments)
+                and all(
+                    isinstance(previous, dict)
+                    and all(
+                        key not in previous and key == "quality_findings"
+                        or previous.get(key) == value
+                        for key, value in asdict(current).items()
+                    )
+                    for previous, current in zip(
+                        previous_segments, document.segments, strict=True
+                    )
+                )
+            )
             if (
                 previous_payload.get("raw_transcript") != record.raw_transcript
-                or previous_payload.get("segments")
-                != [asdict(segment) for segment in document.segments]
+                or not segments_match
             ):
                 raise RuntimeError("The original Phase 9 JSON does not match the saved SQL transcript.")
 
         summary_path, full_path = meeting_pdf_paths(source)
         json_path = output_dir / f"{source.stem}.phase9.json"
+        use_terminology_pipeline = normalization_enabled()
         if json_path.exists():
             raise FileExistsError(
                 "A resume metadata file already exists; choose a new versioned directory."
+            )
+        if use_terminology_pipeline and (
+            output_dir / f"{source.stem}.terminology.json"
+        ).exists():
+            raise FileExistsError(
+                "Terminology stage output already exists; choose a new versioned directory."
             )
 
         output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -449,10 +570,56 @@ def run_controlled_transcript_resume(
                 raise RuntimeError("AudioFileId=4 could not be claimed for transcript resume.")
             lease_token = candidate_lease_token
 
-            cleaned = TranscriptCleanup(
-                config,
-                api_version=api_version,
-            ).clean(document.segments)
+            cleanup_segments = document.segments
+            normalized_transcript = document.raw_transcript
+            normalization_records = ()
+            normalization_findings = ()
+            if use_terminology_pipeline:
+                normalization = normalize_transcript_segments(
+                    document.segments,
+                    recording=source.name,
+                )
+                if normalization.raw_transcript != document.raw_transcript:
+                    raise RuntimeError(
+                        "Saved SQL transcript segments do not match the immutable raw transcript."
+                    )
+                cleanup_segments = normalization.segments
+                normalized_transcript = normalization.normalized_transcript
+                normalization_records = normalization.replacements
+                normalization_findings = normalization.review_findings
+                with (
+                    output_dir / f"{source.stem}.terminology.json"
+                ).open("x", encoding="utf-8") as normalized_file:
+                    json.dump(
+                        {
+                            "source_filename": source.name,
+                            "source_fingerprint": saved_fingerprint,
+                            "raw_transcript": normalization.raw_transcript,
+                            "normalized_transcript": normalization.normalized_transcript,
+                            "normalization_records": [
+                                asdict(item) for item in normalization.replacements
+                            ],
+                            "normalization_review_findings": list(
+                                normalization.review_findings
+                            ),
+                        },
+                        normalized_file,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    normalized_file.write("\n")
+
+            if normalization_findings:
+                cleaned = mark_for_review(
+                    cleanup_segments,
+                    "TerminologyCandidatesRequireReview",
+                    diarization_status=document.diarization_status,
+                )
+            else:
+                cleaned = TranscriptCleanup(
+                    config,
+                    api_version=api_version,
+                ).clean(cleanup_segments)
             transcript = TranscriptDocument(
                 cleaned.segments,
                 document.diarization_status,
@@ -460,6 +627,14 @@ def run_controlled_transcript_resume(
                 cleaned.review_reason,
                 cleaned.input_tokens,
                 cleaned.output_tokens,
+                raw_transcript_source=(
+                    document.raw_transcript if use_terminology_pipeline else None
+                ),
+                normalized_transcript_source=(
+                    normalized_transcript if use_terminology_pipeline else None
+                ),
+                normalization_records=normalization_records,
+                normalization_review_findings=normalization_findings,
             )
             if transcript.cleanup_status != "completed":
                 analysis = MeetingAnalysis.for_review("TranscriptCleanupRequiresReview")

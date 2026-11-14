@@ -26,8 +26,6 @@ from app.config import (
 from app.file_manager import source_fingerprint
 from app.meeting_analysis import GPTMeetingAnalyzer
 from app.phase10_6 import (
-    DEFAULT_PREVIEW_ROOT,
-    DEFAULT_REVIEW_ROOT,
     _artifact_indexes,
     _load_transcript_candidates,
     _approved_state,
@@ -36,6 +34,13 @@ from app.phase10_6 import (
 from app.transcript import TranscriptSegment
 from app.transcript_cleanup import TranscriptCleanup
 from app.transcriber import AzureOpenAITranscriber, estimate_chunk_count
+from app.workspace_paths import (
+    DEFAULT_PHASE10_7_REPORT_ROOT,
+    DEFAULT_PREVIEW_ROOT,
+    DEFAULT_REVIEW_ROOT,
+    get_workspace_root,
+    rebase_manifest_runtime_paths,
+)
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -43,8 +48,8 @@ DEFAULT_ANALYSIS_DIR = PROJECT_ROOT / "references" / "SaraAI" / "analysis"
 DEFAULT_PAIRS_CSV = DEFAULT_ANALYSIS_DIR / "recording_pdf_pairs.csv"
 DEFAULT_RECORDING_ROOT = Path(r"D:\KM\Vault\MorningTalk\Record File\CB")
 DEFAULT_SARA_ROOT = PROJECT_ROOT / "references" / "SaraAI"
-DEFAULT_MANIFEST_PATH = DEFAULT_ANALYSIS_DIR / "phase10_7_pilot_manifest.json"
-DEFAULT_REPORT_PATH = DEFAULT_ANALYSIS_DIR / "phase10_7_pilot_dry_run.md"
+DEFAULT_MANIFEST_PATH = DEFAULT_PHASE10_7_REPORT_ROOT / "phase10_7_pilot_manifest.json"
+DEFAULT_REPORT_PATH = DEFAULT_PHASE10_7_REPORT_ROOT / "phase10_7_pilot_dry_run.md"
 DEFAULT_STAGE_ROOT = DEFAULT_PREVIEW_ROOT / "phase10_7_pilot_batch"
 _MONTHS = ("Sep26", "Oct26", "Nov26")
 _STAGES = ("transcription", "cleanup", "analysis")
@@ -110,12 +115,29 @@ def _atomic_text(path: Path, text: str) -> None:
         Path(temporary_name).unlink(missing_ok=True)
 
 
+def _atomic_bytes(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+
+
 @contextmanager
 def _manifest_lock(manifest_path: Path):
     lock_name = hashlib.sha256(
         str(manifest_path.resolve()).casefold().encode("utf-8")
     ).hexdigest()
-    lock_path = Path(tempfile.gettempdir()) / f"morningtalk-pilot-{lock_name}.lock"
+    temp_root = get_workspace_root() / "temp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    lock_path = temp_root / f"morningtalk-pilot-{lock_name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     try:
@@ -184,6 +206,14 @@ def _stage_config_fingerprints(
     api_version: str,
     terminology: str,
 ) -> dict[str, str]:
+    from app.factory_context import (
+        build_transcription_prompt,
+        load_factory_vocabulary,
+        normalization_enabled,
+        transcription_prompt_enabled,
+    )
+
+    prompt_enabled = transcription_prompt_enabled(config.transcription_api_version)
     transcription = {
         "endpoint": config.transcription_endpoint,
         "deployment": config.transcription_deployment,
@@ -191,12 +221,28 @@ def _stage_config_fingerprints(
         "chunk_duration_seconds": config.chunk_duration_seconds,
         "chunk_overlap_seconds": config.chunk_overlap_seconds,
     }
+    if prompt_enabled:
+        transcription["factory_prompt"] = build_transcription_prompt(
+            load_factory_vocabulary()
+        )
     text = {
         "endpoint": config.text_endpoint,
         "deployment": config.text_deployment,
         "api_version": api_version,
         "terminology": terminology,
     }
+    if normalization_enabled():
+        from app.factory_context import DEFAULT_FACTORY_VOCABULARY_PATH
+
+        text["terminology_normalization"] = {
+            "enabled": True,
+            "vocabulary_master_sha256": _file_hash(
+                Path(os.getenv(
+                    "MORNINGTALK_FACTORY_VOCABULARY_PATH",
+                    str(DEFAULT_FACTORY_VOCABULARY_PATH),
+                ))
+            ),
+        }
     return {
         "transcription": _json_hash(transcription),
         "cleanup": _json_hash(text),
@@ -351,7 +397,7 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         or len(payload["recordings"]) != 3
     ):
         raise PilotBatchError("PilotManifestInvalid")
-    return payload
+    return rebase_manifest_runtime_paths(payload, path)
 
 
 def _validate_saved_recordings(
@@ -607,6 +653,7 @@ def prepare_pilot_dry_run(
                 "preview_root": str(preview_root),
                 "review_root": str(review_root),
                 "stage_root": str(stage_root),
+                "response_root": str(stage_root / "raw_responses"),
             },
             "request_budget": {
                 "per_run_limit": total if max_requests is None else max_requests,
@@ -746,9 +793,20 @@ class _TrackedSession:
             "run_id": self.run_id,
             "recording_relative_path": self.recording["recording_relative_path"],
             "stage": self.stage_name,
+            "stage_config_fingerprint": self.manifest.get(
+                "configuration_fingerprints", {}
+            ).get(self.stage_name),
+            "stage_request_number": 1 + sum(
+                attempt.get("recording_relative_path")
+                == self.recording["recording_relative_path"]
+                and attempt.get("stage") == self.stage_name
+                for attempt in self.manifest["request_attempts"]
+            ),
             "status": "dispatching",
             "started_at_utc": _now(),
         }
+        if self.stage_name == "transcription":
+            attempt["chunk_index"] = attempt["stage_request_number"]
         self.manifest["request_attempts"].append(attempt)
         self.manifest["updated_at_utc"] = _now()
         _atomic_json(self.manifest_path, self.manifest)
@@ -763,9 +821,52 @@ class _TrackedSession:
             _atomic_json(self.manifest_path, self.manifest)
             raise
         status_code = getattr(response, "status_code", None)
-        attempt["status"] = "response_received"
         attempt["http_status"] = status_code if isinstance(status_code, int) else None
         attempt["finished_at_utc"] = _now()
+        try:
+            response_body = response.content
+            if not isinstance(response_body, bytes):
+                raise TypeError("Azure response body is not bytes.")
+            response_root = Path(
+                self.manifest.get("paths", {}).get(
+                    "response_root",
+                    Path(self.manifest.get("paths", {}).get("stage_root", ""))
+                    / "raw_responses",
+                )
+            )
+            if not response_root.is_absolute():
+                raise ValueError("Raw response root must be an absolute private path.")
+            response_directory = _safe_join(
+                response_root,
+                self.recording["recording_relative_path"],
+            ).parent / self.run_id
+            response_path = response_directory / f"{attempt['attempt_id']}.response.bin"
+            _atomic_bytes(response_path, response_body)
+            attempt["raw_response_path"] = str(response_path.resolve())
+            attempt["raw_response_sha256"] = hashlib.sha256(response_body).hexdigest()
+            attempt["raw_response_bytes"] = len(response_body)
+            try:
+                body_json = json.loads(response_body.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                body_json = None
+            usage = body_json.get("usage") if isinstance(body_json, dict) else None
+            if isinstance(usage, dict):
+                input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+                output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+                total_tokens = usage.get("total_tokens")
+                if isinstance(input_tokens, int) and not isinstance(input_tokens, bool):
+                    attempt["input_tokens"] = input_tokens
+                if isinstance(output_tokens, int) and not isinstance(output_tokens, bool):
+                    attempt["output_tokens"] = output_tokens
+                if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
+                    attempt["total_tokens"] = total_tokens
+            attempt["status"] = "response_received"
+        except Exception as error:
+            attempt["status"] = "unknown"
+            attempt["error_class"] = type(error).__name__
+            self.manifest["updated_at_utc"] = _now()
+            _atomic_json(self.manifest_path, self.manifest)
+            raise PilotBatchError("RawAzureResponsePersistenceFailed") from error
         self.manifest["updated_at_utc"] = _now()
         _atomic_json(self.manifest_path, self.manifest)
         return response

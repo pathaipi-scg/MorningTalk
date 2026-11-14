@@ -26,7 +26,7 @@ def test_monitor_defaults_to_database_scan_only_with_300_second_interval():
 
 
 def test_single_monitor_cycle_syncs_database_without_enabling_azure(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("MORNINGTALK_WORKSPACE_ROOT", str(tmp_path))
     calls = []
 
     def scan_cycle(input_dir, **options):
@@ -46,7 +46,7 @@ def test_single_monitor_cycle_syncs_database_without_enabling_azure(tmp_path: Pa
 def test_monitor_retries_failed_scan_on_next_cycle_and_shuts_down_gracefully(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("MORNINGTALK_WORKSPACE_ROOT", str(tmp_path))
     calls = []
     results = iter((2, 0))
 
@@ -75,7 +75,7 @@ def test_monitor_retries_failed_scan_on_next_cycle_and_shuts_down_gracefully(
                 handler.close()
     assert len(calls) == 2
     assert sleep_calls == [17, 17]
-    log_text = (tmp_path / "MorningTalk" / "logs" / "monitor.log").read_text(encoding="utf-8")
+    log_text = (tmp_path / "logs" / "monitor.log").read_text(encoding="utf-8")
     assert "will retry next cycle" in log_text
     assert "Monitor stopped by user" in log_text
 
@@ -176,7 +176,7 @@ def test_missing_input_root_fails_instead_of_appearing_empty(tmp_path: Path):
 def test_monitor_retries_after_temporary_database_failure(
     tmp_path: Path, monkeypatch,
 ):
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("MORNINGTALK_WORKSPACE_ROOT", str(tmp_path))
     calls = []
 
     def scan_cycle(_input_dir, **_options):
@@ -188,7 +188,7 @@ def test_monitor_retries_after_temporary_database_failure(
     monkeypatch.setattr("app.monitor.time.sleep", lambda _seconds: None)
     assert run_monitor(scan_cycle, tmp_path, interval_seconds=1) == 0
     assert len(calls) == 2
-    log_text = (tmp_path / "MorningTalk" / "logs" / "monitor.log").read_text(
+    log_text = (tmp_path / "logs" / "monitor.log").read_text(
         encoding="utf-8"
     )
     assert "error_class=ConnectionError" in log_text

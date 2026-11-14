@@ -6,6 +6,26 @@ import unicodedata
 
 
 @dataclass(frozen=True)
+class TranscriptQualityFinding:
+    original_phrase: str
+    proposed_correction: str | None
+    surrounding_context: str
+    uncertainty: str
+    review_required: bool = True
+
+
+@dataclass(frozen=True)
+class TermNormalizationRecord:
+    original_phrase: str
+    replacement: str
+    vocabulary_master_id: str
+    recording: str
+    chunk_reference: str | None
+    evidence_context: str
+    confirmation_status: str
+
+
+@dataclass(frozen=True)
 class TranscriptSegment:
     start_seconds: float | None
     end_seconds: float | None
@@ -13,6 +33,7 @@ class TranscriptSegment:
     raw_text: str
     cleaned_text: str | None = None
     review_required: bool = False
+    quality_findings: tuple[TranscriptQualityFinding, ...] = ()
 
     @property
     def display_text(self) -> str:
@@ -27,9 +48,21 @@ class TranscriptDocument:
     review_reason: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    raw_transcript_source: str | None = None
+    normalized_transcript_source: str | None = None
+    normalization_records: tuple[TermNormalizationRecord, ...] = ()
+    normalization_review_findings: tuple[dict[str, object], ...] = ()
 
     @property
     def raw_transcript(self) -> str:
+        if self.raw_transcript_source is not None:
+            return self.raw_transcript_source
+        return "\n".join(segment.raw_text for segment in self.segments)
+
+    @property
+    def normalized_transcript(self) -> str:
+        if self.normalized_transcript_source is not None:
+            return self.normalized_transcript_source
         return "\n".join(segment.raw_text for segment in self.segments)
 
     @property
@@ -133,6 +166,7 @@ def mark_for_review(
                 segment.speaker_id,
                 segment.raw_text,
                 review_required=True,
+                quality_findings=segment.quality_findings,
             )
             for segment in segments
         ),

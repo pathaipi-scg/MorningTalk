@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import json
 import logging
 from pathlib import Path
 import subprocess
@@ -15,8 +16,11 @@ import app.file_manager as file_manager
 from app.file_manager import discover_mp3_files, meeting_datetime, pdf_path_for_source, resolve_meeting_output_paths, source_processing_lock
 from app.main import process_file, main
 from app.pdf_export import write_pdf
+from app.transcript import TranscriptDocument, TranscriptSegment
 import app.config as config_module
 import app.transcriber as transcriber_module
+import app.main as main_module
+import app.meeting_outputs as meeting_outputs_module
 from app.transcriber import (
     AzureOpenAITranscriber, AzureTranscriptionError, _merge_overlapping_transcripts,
     estimate_chunk_count,
@@ -130,6 +134,96 @@ def test_force_atomically_overwrites_existing_outputs(tmp_path: Path, monkeypatc
     transcriber.transcribe.assert_called_once_with(source)
 
 
+def test_terminology_pipeline_requires_cleanup_before_transcription(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
+    monkeypatch.setenv("MORNINGTALK_ENABLE_TERMINOLOGY_NORMALIZATION", "true")
+    root = tmp_path / "input"
+    source = root / "Plant" / "Nov26" / "meeting.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"audio")
+    transcriber = Mock()
+
+    with pytest.raises(ValueError, match="requires an injected AI cleanup validator"):
+        process_file(source, root, transcriber)
+
+    transcriber.transcribe.assert_not_called()
+    paths = resolve_meeting_output_paths(source)
+    assert not paths.transcript_text.exists()
+    assert not paths.full_transcript_pdf.exists()
+
+
+def test_terminology_pipeline_cleans_and_publishes_canonical_full_transcript(
+    tmp_path: Path, monkeypatch,
+):
+    transcript_root = tmp_path / "Transcript"
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", transcript_root)
+    monkeypatch.setattr(main_module, "get_workspace_root", lambda: workspace)
+    monkeypatch.setattr(
+        meeting_outputs_module,
+        "DEFAULT_TEMP_ROOT",
+        workspace / "temp",
+    )
+    monkeypatch.setenv("MORNINGTALK_ENABLE_TERMINOLOGY_NORMALIZATION", "true")
+    root = tmp_path / "input"
+    source = root / "Plant" / "Nov26" / "meeting.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"audio")
+    transcriber = Mock()
+    transcriber.transcribe.return_value = "เครื่อง ทวินโอเดอร์ขัดข้อง"
+    cleanup_inputs = []
+
+    def cleanup(segments):
+        cleanup_inputs.extend(segments)
+        text = segments[0].raw_text
+        return TranscriptDocument(
+            (TranscriptSegment(None, None, None, text, text),),
+            "unavailable",
+            "completed",
+        )
+
+    assert process_file(source, root, transcriber, cleanup=cleanup)
+
+    paths = resolve_meeting_output_paths(source)
+    assert paths.transcript_text.read_text(encoding="utf-8") == (
+        "เครื่อง Twinloaderขัดข้อง"
+    )
+    assert cleanup_inputs[0].raw_text == "เครื่อง Twinloaderขัดข้อง"
+    stage_files = list((workspace / "transcription_stages" / source.stem).glob("*.json"))
+    assert len(stage_files) == 1
+    stage_payload = json.loads(stage_files[0].read_text(encoding="utf-8"))
+    assert stage_payload["raw_transcript"] == "เครื่อง ทวินโอเดอร์ขัดข้อง"
+    assert stage_payload["normalized_transcript"] == "เครื่อง Twinloaderขัดข้อง"
+    assert stage_payload["normalization_records"][0]["replacement"] == "Twinloader"
+
+
+def test_terminology_cleanup_failure_preserves_existing_standard_outputs(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
+    monkeypatch.setattr(main_module, "get_workspace_root", lambda: tmp_path / "workspace")
+    monkeypatch.setenv("MORNINGTALK_ENABLE_TERMINOLOGY_NORMALIZATION", "true")
+    root = tmp_path / "input"
+    source = root / "Plant" / "Nov26" / "meeting.mp3"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"audio")
+    paths = resolve_meeting_output_paths(source)
+    paths.directory.mkdir(parents=True)
+    paths.transcript_text.write_text("existing text", encoding="utf-8")
+    paths.full_transcript_pdf.write_bytes(b"existing pdf")
+    transcriber = Mock()
+    transcriber.transcribe.return_value = "ข้อความใหม่"
+    cleanup = lambda _segments: TranscriptDocument((), "unavailable", "review_required")
+
+    with pytest.raises(ValueError, match="TranscriptCleanupRequiresReview"):
+        process_file(source, root, transcriber, force=True, cleanup=cleanup)
+
+    assert paths.transcript_text.read_text(encoding="utf-8") == "existing text"
+    assert paths.full_transcript_pdf.read_bytes() == b"existing pdf"
+
+
 def test_azure_transcription_uses_mock_and_thai_language(tmp_path: Path, single_audio_chunk):
     source = tmp_path / "meeting.mp3"
     source.write_bytes(b"mock audio")
@@ -152,7 +246,8 @@ def test_azure_transcription_uses_mock_and_thai_language(tmp_path: Path, single_
     )
     assert call.kwargs["params"] == {"api-version": "2025-03-01-preview"}
     assert call.kwargs["headers"]["api-key"] == "test-transcription-key"
-    assert call.kwargs["data"] == {"language": "th"}
+    assert call.kwargs["data"]["language"] == "th"
+    assert "prompt" not in call.kwargs["data"]
     assert call.kwargs["timeout"] == (30, 1800)
     assert call.kwargs["files"]["file"][0] == "audio.mp3"
     assert call.kwargs["files"]["file"][2] == "audio/mpeg"
@@ -173,6 +268,38 @@ def test_v1_api_uses_transcription_deployment_as_model(tmp_path: Path, single_au
     assert call.kwargs["params"] is None
     assert call.kwargs["data"]["model"] == "audio-deployment"
     assert call.kwargs["data"]["language"] == "th"
+    assert "prompt" not in call.kwargs["data"]
+
+
+def test_documented_transcription_prompt_requires_explicit_opt_in(
+    tmp_path: Path, single_audio_chunk, monkeypatch,
+):
+    source = tmp_path / "meeting.mp3"
+    source.write_bytes(b"mock audio")
+    response = Mock(status_code=200)
+    response.json.return_value = {"text": "ประชุมเริ่มแล้ว"}
+    session = Mock()
+    session.post.return_value = response
+    monkeypatch.setenv("MORNINGTALK_ENABLE_TRANSCRIPTION_PROMPT", "true")
+    config = make_azure_config(api_version="2025-04-01-preview")
+
+    assert AzureOpenAITranscriber(config, session).transcribe(source) == "ประชุมเริ่มแล้ว"
+
+    prompt = session.post.call_args.kwargs["data"]["prompt"]
+    assert "Twinloader" in prompt
+    assert "Twin Loader" not in prompt
+    assert "Encoder" not in prompt
+    assert "ทวินโอเดอร์" not in prompt
+
+
+def test_transcription_prompt_rejects_undocumented_api_version(monkeypatch):
+    monkeypatch.setenv("MORNINGTALK_ENABLE_TRANSCRIPTION_PROMPT", "true")
+    monkeypatch.setattr(transcriber_module.shutil, "which", lambda command: command)
+    with pytest.raises(ValueError, match="not enabled for this documented API version"):
+        AzureOpenAITranscriber(
+            make_azure_config(api_version="2025-03-01-preview"),
+            Mock(),
+        )
 
 
 def test_large_audio_is_split_with_boundary_overlap(tmp_path: Path, monkeypatch):

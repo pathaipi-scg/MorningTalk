@@ -247,8 +247,12 @@ def write_meeting_summary_pdf(
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
         raise FileExistsError(f"PDF already exists: {path.name}")
-    if overwrite and draft and analysis.status != "validated":
-        raise ValueError("An existing summary draft can only be replaced by validated analysis.")
+    reviewable = analysis.overview is not None
+    if overwrite and draft and (
+        analysis.status != "validated"
+        and not (analysis.status == "review_required" and reviewable)
+    ):
+        raise ValueError("An existing summary draft requires evidence-validated analysis.")
     font = _thai_font()
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.stem}.", suffix=".tmp.pdf", dir=path.parent
@@ -341,6 +345,8 @@ def write_meeting_summary_pdf(
             item_text = f"<b>{escape(topic_parts[0])}</b> — {escape(topic_parts[1])}"
         else:
             item_text = escape(item.text)
+        if analysis.status != "validated":
+            item_text = f"<b>รอตรวจสอบ — </b>{item_text}"
         story.append(
             Paragraph(
                 item_text,
@@ -350,16 +356,29 @@ def write_meeting_summary_pdf(
         )
         if item.owner:
             story.append(
-                Paragraph(f"ผู้รับผิดชอบ: {escape(item.owner)}", metadata)
+                Paragraph(
+                    f"{'รอตรวจสอบ: ' if analysis.status != 'validated' else ''}"
+                    f"ผู้รับผิดชอบ: {escape(item.owner)}",
+                    metadata,
+                )
             )
         if item.deadline:
             story.append(
-                Paragraph(f"กำหนดเวลา: {escape(item.deadline)}", metadata)
+                Paragraph(
+                    f"{'รอตรวจสอบ: ' if analysis.status != 'validated' else ''}"
+                    f"กำหนดเวลา: {escape(item.deadline)}",
+                    metadata,
+                )
             )
-        if analysis.status == "validated" and item.evidence:
+        if item.evidence:
             references = sorted({reference.segment_id for reference in item.evidence})
             story.append(Paragraph(
-                "หลักฐาน: ช่วงที่ " + ", ".join(map(str, references)),
+                (
+                    "หลักฐาน: ช่วงที่ "
+                    if analysis.status == "validated"
+                    else "หลักฐานอ้างอิงเพื่อการตรวจทาน: ช่วงที่ "
+                )
+                + ", ".join(map(str, references)),
                 metadata,
             ))
 

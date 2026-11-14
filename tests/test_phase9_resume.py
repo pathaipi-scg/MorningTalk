@@ -11,7 +11,12 @@ import app.file_manager as file_manager
 from app.database import SavedTranscriptRecord
 from app.meeting_analysis import AnalysisItem, EvidenceReference, MeetingAnalysis
 from app.meeting_outputs import MeetingPdfOutputs, PdfOutputStatus, meeting_pdf_paths
-from app.transcript import TranscriptDocument, TranscriptSegment, mark_for_review
+from app.transcript import (
+    TranscriptDocument,
+    TranscriptQualityFinding,
+    TranscriptSegment,
+    mark_for_review,
+)
 from app.file_manager import source_fingerprint
 
 
@@ -131,6 +136,68 @@ def _run(input_dir, output_dir):
         confirm_azure_billing=True,
         confirm_mssql_write=True,
     )
+
+
+def test_saved_phase9_segments_without_quality_findings_remain_readable():
+    segment = {
+        "start_seconds": 1.0,
+        "end_seconds": 2.0,
+        "speaker_id": "Speaker A",
+        "raw_text": "ตรวจ Encoder Lot 123",
+        "cleaned_text": "ตรวจ Encoder Lot 123",
+        "review_required": False,
+    }
+    record = SavedTranscriptRecord(
+        1,
+        r"D:\Record File\CB\Nov26\meeting.mp3",
+        "fingerprint",
+        "completed",
+        segment["raw_text"],
+        json.dumps([segment], ensure_ascii=False),
+        "available",
+        None,
+        None,
+    )
+
+    document = phase9._saved_transcript_document(record)
+
+    assert document.raw_transcript == segment["raw_text"]
+    assert document.cleaned_transcript == segment["cleaned_text"]
+    assert document.segments[0].quality_findings == ()
+
+
+def test_quality_findings_round_trip_through_phase9_segment_json():
+    finding = TranscriptQualityFinding(
+        "พ่อครับ",
+        None,
+        "บริบทพ่อครับรอบข้าง",
+        "high",
+    )
+    segment = TranscriptSegment(
+        1,
+        2,
+        "Speaker A",
+        "บริบทพ่อครับรอบข้าง",
+        "บริบทพ่อครับรอบข้าง",
+        True,
+        (finding,),
+    )
+    record = SavedTranscriptRecord(
+        1,
+        r"D:\Record File\CB\Nov26\meeting.mp3",
+        "fingerprint",
+        "review_required",
+        segment.raw_text,
+        json.dumps([asdict(segment)], ensure_ascii=False),
+        "available",
+        None,
+        None,
+    )
+
+    document = phase9._saved_transcript_document(record)
+
+    assert document.segments[0].review_required
+    assert document.segments[0].quality_findings == (finding,)
 
 
 def test_resume_uses_saved_transcript_and_never_calls_transcriber(tmp_path, monkeypatch):

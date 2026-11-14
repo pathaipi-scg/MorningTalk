@@ -32,6 +32,7 @@ from app.transcript import (
     preserves_numbers_and_codes,
     validate_segment_times,
 )
+from app.workspace_paths import get_workspace_root
 
 logger = logging.getLogger(__name__)
 EXPECTED_RECORDING = "meeting-20261107-0817.mp3"
@@ -170,11 +171,7 @@ def preflight_analysis_resume(
     phase9_json_path = phase9_json_path.resolve()
     source = source.resolve()
     output_dir = output_dir.resolve()
-    preview_root = (
-        Path(os.getenv("LOCALAPPDATA", str(Path.home())))
-        / "MorningTalk"
-        / "previews"
-    ).resolve()
+    preview_root = (get_workspace_root() / "previews").resolve()
     try:
         relative_output = output_dir.relative_to(preview_root)
     except ValueError as error:

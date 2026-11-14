@@ -7,7 +7,9 @@ from pypdf import PdfReader
 
 from app.file_manager import source_fingerprint
 import app.file_manager as file_manager
+from app.meeting_analysis import AnalysisItem, EvidenceReference, MeetingAnalysis
 from app.main import main
+from app.pdf_export import write_meeting_summary_pdf
 from app.summary_preview import (
     SummaryPreviewNotReady,
     write_sara_layout_demo,
@@ -96,6 +98,46 @@ def test_offline_summary_preview_renders_only_validated_evidence(tmp_path: Path,
     assert "หมวดหมู่การประชุม" in extracted
     assert "ตรวจสอบ Encoder Lot 123" in extracted
     assert "DRAFT - NOT APPROVED" in extracted
+
+
+def test_review_required_draft_labels_claims_and_owners_for_review(tmp_path: Path):
+    source = tmp_path / "meeting-20261107-0817.mp3"
+    source.write_bytes(b"fixture source")
+    claim = AnalysisItem(
+        "ตรวจสอบ Encoder",
+        (EvidenceReference(1, quote="ตรวจสอบ Encoder"),),
+        owner="ผู้พูด",
+        deadline="พรุ่งนี้",
+    )
+    analysis = MeetingAnalysis(
+        overview=claim,
+        classifications=(),
+        key_issues=(),
+        actions=(claim,),
+        dependencies=(),
+        schedules=(),
+        risks=(),
+        status="review_required",
+        review_reason="SemanticReviewRequired",
+    )
+    output = tmp_path / "meeting_Summary_Draft.pdf"
+
+    write_meeting_summary_pdf(
+        output,
+        source,
+        "CB",
+        analysis,
+        draft=True,
+    )
+
+    extracted = "\n".join(
+        page.extract_text() or "" for page in PdfReader(str(output)).pages
+    )
+    assert "DRAFT - NOT APPROVED" in extracted
+    assert extracted.count("รอตรวจสอบ") >= 3
+    assert "หลักฐานอ้างอิงเพื่อการตรวจทาน" in extracted
+    assert "ผู้รับผิดชอบ" in extracted
+    assert "กำหนดเวลา" in extracted
 
 
 def test_offline_summary_preview_refuses_unvalidated_analysis_without_placeholder(

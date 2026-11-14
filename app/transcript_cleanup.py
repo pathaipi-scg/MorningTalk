@@ -16,8 +16,10 @@ from app.azure_openai_http import (
     response_token_usage,
 )
 from app.config import AzureConfig
+from app.factory_context import load_factory_vocabulary
 from app.transcript import (
     TranscriptDocument,
+    TranscriptQualityFinding,
     TranscriptSegment,
     mark_for_review,
     number_code_count,
@@ -34,10 +36,7 @@ _NUMERIC_UNITS = frozenset(
     }
 )
 _CODE_PREFIXES = frozenset({"lot", "line", "no", "serial"})
-DEFAULT_TERMINOLOGY = (
-    "Encoder, Stepping, Stacking, Press, Curing, Depallet, Pallet, Lot, "
-    "Silo, Mould, LINE1, LINE2"
-)
+_UNCERTAINTY_LEVELS = frozenset({"low", "medium", "high"})
 
 
 class TranscriptCleanup:
@@ -56,9 +55,17 @@ class TranscriptCleanup:
         self._config = config
         self._api_version = api_version
         self._session = session
-        self._terminology = terminology if terminology is not None else os.getenv(
-            "MORNINGTALK_TERMINOLOGY", DEFAULT_TERMINOLOGY
+        self._factory_vocabulary = load_factory_vocabulary()
+        custom_terminology = (
+            terminology
+            if terminology is not None
+            else os.getenv("MORNINGTALK_TERMINOLOGY", "")
         )
+        all_terms = [
+            *self._factory_vocabulary.terms,
+            *(term.strip() for term in custom_terminology.split(",") if term.strip()),
+        ]
+        self._terminology = ", ".join(dict.fromkeys(all_terms))
 
     def clean(self, segments: tuple[TranscriptSegment, ...]) -> TranscriptDocument:
         chunks: list[tuple[int, int, int, str, str]] = []
@@ -67,15 +74,32 @@ class TranscriptCleanup:
                 chunks.append((segment_index, start, end, text, separator))
         payload = {
             "segments": [
-                {"index": index, "text": text}
+                {
+                    "index": index,
+                    "source_segment_index": segment_index,
+                    "text": text,
+                }
                 for index, (_segment_index, _start, _end, text, _separator)
                 in enumerate(chunks)
             ],
+            "factory_context_th": self._factory_vocabulary.context_th,
             "terminology": self._terminology,
         }
         prompt = (
-            "Edit Thai transcript spelling, punctuation, and sentence boundaries only. "
-            "Return JSON exactly as {\"segments\":[{\"index\":0,\"text\":\"...\"}]}. "
+            "บริบท: พนักงานโรงงานผลิตกระเบื้องหลังคาคอนกรีตกำลังสนทนาเรื่องการผลิต "
+            "เครื่องจักร คุณภาพ ซ่อมบำรุง และความปลอดภัย. "
+            "แก้คำถอดเสียงที่ผิดได้เฉพาะเมื่อเสียงและบริบทรอบข้างสนับสนุนอย่างชัดเจน. "
+            "คำศัพท์โรงงานเป็นเพียงคำใบ้ ห้ามแทนคำที่ไม่คุ้นด้วยคำโรงงานที่ฟังดูเป็นไปได้ "
+            "ห้ามแต่งชื่อเครื่องจักร บุคคล จำนวน กำหนดเวลา หรือการกระทำ. "
+            "คงคำศัพท์เทคนิคและตัวเลขตามต้นฉบับ. หากคำไม่ชัดหรือดูไม่สมเหตุผล "
+            "ให้คงข้อความเดิมและเพิ่มรายการ review_findings เพื่อให้คนตรวจ. "
+            "รักษาเจตนาและความหมายการสนทนา ห้ามสรุปหรือเขียนใหม่เป็นรายงานประชุม. "
+            "Return JSON with segments and review_findings. "
+            "Each finding has index (input excerpt index), original_phrase, "
+            "proposed_correction (string or null), context copied exactly from input, "
+            "and uncertainty (low, medium, or high). "
+            "Return JSON exactly as {\"segments\":[{\"index\":0,\"text\":\"...\"}],"
+            "\"review_findings\":[]}. "
             "Keep every utterance, conversational turn, technical term, number, and Lot ID. "
             "Preserve every numeric value and code exactly and in the same order. Do not "
             "add, remove, convert, round, or reformat numbers or codes; preserve their "
@@ -95,7 +119,10 @@ class TranscriptCleanup:
         if endpoint.api_mode == "responses":
             request_payload = {
                 "model": self._config.text_deployment,
-                "instructions": "You are a conservative Thai transcript proofreader.",
+                "instructions": (
+                    "You are a conservative Thai transcript proofreader for concrete roof tile "
+                    "manufacturing. Never guess uncertain words."
+                ),
                 "input": [
                     {
                         "role": "user",
@@ -122,9 +149,38 @@ class TranscriptCleanup:
                                         "required": ["index", "text"],
                                         "additionalProperties": False,
                                     },
-                                }
+                                },
+                                "review_findings": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "index": {"type": "integer"},
+                                            "original_phrase": {"type": "string"},
+                                            "proposed_correction": {
+                                                "anyOf": [
+                                                    {"type": "string"},
+                                                    {"type": "null"},
+                                                ]
+                                            },
+                                            "context": {"type": "string"},
+                                            "uncertainty": {
+                                                "type": "string",
+                                                "enum": ["low", "medium", "high"],
+                                            },
+                                        },
+                                        "required": [
+                                            "index",
+                                            "original_phrase",
+                                            "proposed_correction",
+                                            "context",
+                                            "uncertainty",
+                                        ],
+                                        "additionalProperties": False,
+                                    },
+                                },
                             },
-                            "required": ["segments"],
+                            "required": ["segments", "review_findings"],
                             "additionalProperties": False,
                         },
                     }
@@ -134,7 +190,13 @@ class TranscriptCleanup:
             request_payload = {
                 "model": self._config.text_deployment,
                 "messages": [
-                    {"role": "system", "content": "You are a conservative Thai transcript proofreader."},
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a conservative Thai transcript proofreader for concrete "
+                            "roof tile manufacturing. Never guess uncertain words."
+                        ),
+                    },
                     {"role": "user", "content": prompt},
                 ],
                 "max_completion_tokens": 16000,
@@ -250,6 +312,9 @@ class TranscriptCleanup:
                 expected_count=len(chunks),
                 actual_count=len(cleaned_items),
             )
+        raw_findings = parsed.get("review_findings", [])
+        if not isinstance(raw_findings, list):
+            return validation_failure("ReviewFindingsNotArray")
 
         cleaned_chunks: list[str] = []
         for index, ((_segment_index, _start, _end, original_text, _separator), item) in enumerate(
@@ -303,7 +368,92 @@ class TranscriptCleanup:
                     mismatch_category=mismatch[0],
                     mismatch_position=mismatch[1],
                 )
+            for entry in self._factory_vocabulary.entries:
+                canonical = entry.canonical_english
+                if (
+                    entry.confirmation_status != "USER_CONFIRMED"
+                    or canonical is None
+                    or canonical.casefold() not in original_text.casefold()
+                ):
+                    continue
+                if (
+                    canonical.casefold() not in text.casefold()
+                    or any(
+                        variant.casefold() in text.casefold()
+                        for variant in entry.thai_phonetic_variants
+                    )
+                ):
+                    return validation_failure(
+                        "ConfirmedTerminologyChanged",
+                        index=index,
+                        original_text=original_text,
+                        cleaned_text=text,
+                    )
             cleaned_chunks.append(text.strip())
+
+        findings_by_segment: list[list[TranscriptQualityFinding]] = [
+            [] for _ in segments
+        ]
+        for finding in raw_findings:
+            if not isinstance(finding, dict):
+                return validation_failure("ReviewFindingNotObject")
+            index = finding.get("index")
+            phrase = finding.get("original_phrase")
+            correction = finding.get("proposed_correction")
+            context = finding.get("context")
+            uncertainty = finding.get("uncertainty")
+            if (
+                type(index) is not int
+                or not 0 <= index < len(chunks)
+                or not isinstance(phrase, str)
+                or not phrase.strip()
+                or not isinstance(context, str)
+                or not context.strip()
+                or not isinstance(uncertainty, str)
+                or uncertainty not in _UNCERTAINTY_LEVELS
+                or correction is not None and not isinstance(correction, str)
+            ):
+                return validation_failure("ReviewFindingFieldsInvalid")
+            source_segment_index, _start, _end, source_excerpt, _separator = chunks[index]
+            if (
+                phrase not in source_excerpt
+                or phrase not in context
+                or context not in source_excerpt
+            ):
+                return validation_failure("ReviewFindingNotSourceGrounded")
+            if correction is not None and not correction.strip():
+                return validation_failure("ReviewCorrectionEmpty")
+            findings_by_segment[source_segment_index].append(
+                TranscriptQualityFinding(
+                    phrase,
+                    correction,
+                    context,
+                    uncertainty,
+                )
+            )
+
+        for segment_index, original in enumerate(segments):
+            for suspicious_phrase in self._factory_vocabulary.suspicious_phrases:
+                if suspicious_phrase.casefold() not in original.raw_text.casefold():
+                    continue
+                if any(
+                    item.original_phrase.casefold() == suspicious_phrase.casefold()
+                    for item in findings_by_segment[segment_index]
+                ):
+                    continue
+                start = original.raw_text.casefold().find(suspicious_phrase.casefold())
+                context_start = max(0, start - 60)
+                context_end = min(
+                    len(original.raw_text), start + len(suspicious_phrase) + 60
+                )
+                findings_by_segment[segment_index].append(
+                    TranscriptQualityFinding(
+                        suspicious_phrase,
+                        None,
+                        original.raw_text[context_start:context_end],
+                        "high",
+                    )
+                )
 
         reconstructed: list[list[str]] = [[] for _ in segments]
         for chunk_index, (segment_index, _start, _end, _text, separator) in enumerate(chunks):
@@ -316,15 +466,21 @@ class TranscriptCleanup:
                 original.end_seconds,
                 original.speaker_id,
                 original.raw_text,
-                "".join(reconstructed[index]).strip(),
+                original.raw_text
+                if findings_by_segment[index]
+                else "".join(reconstructed[index]).strip(),
+                original.review_required or bool(findings_by_segment[index]),
+                tuple(findings_by_segment[index]),
             )
             for index, original in enumerate(segments)
         ]
 
+        has_findings = any(findings_by_segment)
         return TranscriptDocument(
             tuple(cleaned),
             "available",
-            "completed",
+            "review_required" if has_findings else "completed",
+            "UncertainSpeechRequiresReview" if has_findings else None,
             input_tokens=input_tokens if isinstance(input_tokens, int) else None,
             output_tokens=output_tokens if isinstance(output_tokens, int) else None,
         )

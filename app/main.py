@@ -1,12 +1,22 @@
 """MorningTalk command-line transcription workflow."""
 
 import argparse
+from dataclasses import asdict
+import json
 import logging
 from pathlib import Path
+import tempfile
 import sys
+from typing import Callable
+import uuid
 
 from app.auto_scan import process_scanned_file, synchronize_scan
-from app.config import DEFAULT_INPUT_DIR, get_azure_config, get_sql_config
+from app.config import (
+    DEFAULT_INPUT_DIR,
+    get_azure_config,
+    get_azure_openai_api_version,
+    get_sql_config,
+)
 from app.database import AudioRecord, SqlRepository, connect_sql
 from app.file_manager import (
     discover_mp3_files,
@@ -24,6 +34,7 @@ from app.phase10 import (
 )
 from app.phase10_6 import (
     DEFAULT_ANALYSIS_DIR,
+    DEFAULT_EVALUATION_DIR,
     DEFAULT_PREVIEW_ROOT as PHASE10_PREVIEW_ROOT,
     DEFAULT_RECORDING_ROOT,
     DEFAULT_REVIEW_ROOT,
@@ -58,10 +69,28 @@ from app.summary_preview import (
     write_sara_summary_preview,
 )
 from app.transcriber import AzureOpenAITranscriber, estimate_chunk_count
-from app.meeting_outputs import write_transcript_text
+from app.factory_context import (
+    normalize_transcript_segments,
+    normalization_enabled,
+)
+from app.meeting_outputs import (
+    _validate_staged_pdf,
+    publish_staged_output_set,
+    write_transcript_text,
+)
+from app.transcript import TranscriptDocument, TranscriptSegment
+from app.transcript_cleanup import TranscriptCleanup
+from app.workspace_paths import get_workspace_root
 
 
-def process_file(source: Path, input_dir: Path, transcriber, force: bool = False) -> bool:
+def process_file(
+    source: Path,
+    input_dir: Path,
+    transcriber,
+    force: bool = False,
+    *,
+    cleanup: Callable[[tuple[TranscriptSegment, ...]], TranscriptDocument] | None = None,
+) -> bool:
     output_paths = resolve_meeting_output_paths(source)
     pdf_path = output_paths.full_transcript_pdf
     with source_processing_lock(source):
@@ -74,20 +103,78 @@ def process_file(source: Path, input_dir: Path, transcriber, force: bool = False
             return False
         if not source.is_file() or source.stat().st_size == 0:
             raise ValueError(f"Input is missing or empty: {source}")
+        use_terminology_pipeline = normalization_enabled()
+        if use_terminology_pipeline and cleanup is None:
+            raise ValueError(
+                "Terminology normalization requires an injected AI cleanup validator."
+            )
         original_fingerprint = source_fingerprint(source)
-        transcript = transcriber.transcribe(source)
-        if not transcript.strip():
+        raw_transcript = transcriber.transcribe(source)
+        if not raw_transcript.strip():
             raise ValueError(f"Transcription returned no text for {source.name}")
+        transcript = raw_transcript
+        if use_terminology_pipeline:
+            normalized = normalize_transcript_segments(
+                (TranscriptSegment(None, None, None, raw_transcript),),
+                recording=source.name,
+            )
+            stage_root = get_workspace_root() / "transcription_stages" / source.stem
+            stage_root.mkdir(parents=True, exist_ok=True)
+            stage_path = stage_root / f"{uuid.uuid4().hex}.terminology.json"
+            with stage_path.open("x", encoding="utf-8") as stage_file:
+                json.dump(
+                    {
+                        "source_filename": source.name,
+                        "source_fingerprint": original_fingerprint,
+                        "raw_transcript": normalized.raw_transcript,
+                        "normalized_transcript": normalized.normalized_transcript,
+                        "normalization_records": [
+                            asdict(record) for record in normalized.replacements
+                        ],
+                        "normalization_review_findings": list(
+                            normalized.review_findings
+                        ),
+                    },
+                    stage_file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                stage_file.write("\n")
+            if normalized.review_findings:
+                raise ValueError(
+                    f"TerminologyNormalizationRequiresReview:{stage_path}"
+                )
+            cleaned = cleanup(normalized.segments) if cleanup is not None else None
+            if cleaned is None or cleaned.cleanup_status != "completed":
+                raise ValueError(
+                    f"TranscriptCleanupRequiresReview:{stage_path}"
+                )
+            transcript = cleaned.cleaned_transcript
+            if not transcript.strip():
+                raise ValueError(f"Transcript cleanup returned no text for {source.name}")
         plant = source.parent.parent.name
         if source_fingerprint(source) != original_fingerprint:
             raise RuntimeError(f"Source MP3 changed during processing: {source.name}")
-        output_paths.directory.mkdir(parents=True, exist_ok=True)
-        write_transcript_text(
-            output_paths.transcript_text,
-            transcript,
-            overwrite=True,
-        )
-        write_pdf(pdf_path, source, plant, transcript, overwrite=True)
+        staging_root = get_workspace_root() / "temp"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="standard-transcript-", dir=staging_root
+        ) as directory:
+            staged_directory = Path(directory)
+            staged_text = staged_directory / output_paths.transcript_text.name
+            staged_pdf = staged_directory / pdf_path.name
+            write_transcript_text(staged_text, transcript, overwrite=False)
+            write_pdf(staged_pdf, source, plant, transcript, overwrite=False)
+            if staged_text.read_text(encoding="utf-8") != transcript:
+                raise ValueError("Staged transcript text validation failed.")
+            _validate_staged_pdf(staged_pdf, transcript)
+            publish_staged_output_set(
+                {
+                    output_paths.transcript_text: staged_text,
+                    pdf_path: staged_pdf,
+                },
+                approved_summary=output_paths.approved_summary_pdf,
+            )
     logging.info("Completed: %s", source)
     return True
 
@@ -165,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_ANALYSIS_DIR / "recording_pdf_pairs.csv",
     )
-    parser.add_argument("--evaluation-dir", type=Path, default=DEFAULT_ANALYSIS_DIR)
+    parser.add_argument("--evaluation-dir", type=Path, default=DEFAULT_EVALUATION_DIR)
     parser.add_argument("--preview-root", type=Path, default=PHASE10_PREVIEW_ROOT)
     parser.add_argument("--review-root", type=Path, default=DEFAULT_REVIEW_ROOT)
     parser.add_argument("--analysis-json", type=Path)
@@ -788,11 +875,23 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         config = get_azure_config()
         transcriber = AzureOpenAITranscriber(config)
+        cleanup = None
+        if normalization_enabled():
+            cleanup = TranscriptCleanup(
+                config,
+                api_version=get_azure_openai_api_version(),
+            ).clean
         failures = 0
         for source in files:
             try:
                 logging.info("Processing %s", source)
-                process_file(source, input_dir, transcriber, args.force)
+                process_file(
+                    source,
+                    input_dir,
+                    transcriber,
+                    args.force,
+                    cleanup=cleanup,
+                )
             except Exception:
                 failures += 1
                 logging.exception("Failed to process %s", source)

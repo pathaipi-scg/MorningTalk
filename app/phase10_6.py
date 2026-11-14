@@ -25,22 +25,18 @@ from app.transcript import (
     preserves_numbers_and_codes,
     validate_segment_times,
 )
+from app.workspace_paths import (
+    DEFAULT_PHASE10_6_REPORT_ROOT,
+    DEFAULT_PREVIEW_ROOT,
+    DEFAULT_REVIEW_ROOT,
+)
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ANALYSIS_DIR = PROJECT_ROOT / "references" / "SaraAI" / "analysis"
 DEFAULT_RECORDING_ROOT = Path(r"D:\KM\Vault\MorningTalk\Record File\CB")
 DEFAULT_SARA_ROOT = PROJECT_ROOT / "references" / "SaraAI"
-DEFAULT_PREVIEW_ROOT = (
-    Path(os.getenv("LOCALAPPDATA", str(Path.home())))
-    / "MorningTalk"
-    / "previews"
-)
-DEFAULT_REVIEW_ROOT = (
-    Path(os.getenv("LOCALAPPDATA", str(Path.home())))
-    / "MorningTalk"
-    / "reviews"
-)
+DEFAULT_EVALUATION_DIR = DEFAULT_PHASE10_6_REPORT_ROOT
 _SECTIONS = (
     "overview",
     "classifications",
@@ -894,7 +890,7 @@ def evaluate_batch(
     pairs_csv: Path = DEFAULT_ANALYSIS_DIR / "recording_pdf_pairs.csv",
     preview_root: Path = DEFAULT_PREVIEW_ROOT,
     review_root: Path = DEFAULT_REVIEW_ROOT,
-    output_dir: Path = DEFAULT_ANALYSIS_DIR,
+    output_dir: Path = DEFAULT_EVALUATION_DIR,
 ) -> BatchEvaluation:
     if not recording_root.is_dir() or not sara_root.is_dir():
         raise ReviewWorkflowError("DatasetRootUnavailable")

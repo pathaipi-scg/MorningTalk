@@ -45,9 +45,9 @@ def _fixture(tmp_path: Path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    local_app_data = tmp_path / "localappdata"
-    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
-    output_dir = local_app_data / "MorningTalk" / "previews" / "phase10-test"
+    workspace_root = tmp_path / "workspace"
+    monkeypatch.setenv("MORNINGTALK_WORKSPACE_ROOT", str(workspace_root))
+    output_dir = workspace_root / "previews" / "phase10-test"
     config = AzureConfig(
         text_endpoint=ENDPOINT,
         text_api_key="not-a-real-key",

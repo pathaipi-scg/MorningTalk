@@ -8,6 +8,8 @@ from pathlib import Path
 import time
 from typing import Callable, Iterator
 
+from app.workspace_paths import get_workspace_root
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,9 +18,7 @@ class MonitorAlreadyRunning(RuntimeError):
 
 
 def runtime_directory() -> Path:
-    local_app_data = os.getenv("LOCALAPPDATA")
-    base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-    return base / "MorningTalk"
+    return get_workspace_root()
 
 
 def configure_monitor_logging() -> Path:
@@ -120,7 +120,7 @@ def run_monitor(
     if interval_seconds <= 0:
         raise ValueError("Monitor interval must be positive.")
     log_path = configure_monitor_logging()
-    lock_path = runtime_directory() / "monitor.lock"
+    lock_path = runtime_directory() / "temp" / "monitor.lock"
     try:
         with monitor_instance_lock(lock_path):
             logger.info(

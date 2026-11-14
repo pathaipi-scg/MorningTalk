@@ -17,6 +17,12 @@ import unicodedata
 import requests
 
 from app.config import AzureConfig
+from app.factory_context import (
+    build_transcription_prompt,
+    load_factory_vocabulary,
+    transcription_prompt_enabled,
+)
+from app.workspace_paths import get_workspace_root
 
 logger = logging.getLogger(__name__)
 CHUNK_AUDIO_BYTES = 20 * 1024 * 1024
@@ -72,6 +78,11 @@ class AzureOpenAITranscriber(Transcriber):
         self._chunk_duration = config.chunk_duration_seconds
         self._chunk_overlap = config.chunk_overlap_seconds
         self._chunk_callback = chunk_callback
+        self._factory_vocabulary = (
+            load_factory_vocabulary()
+            if transcription_prompt_enabled(config.transcription_api_version)
+            else None
+        )
 
     def transcribe(self, audio_path: Path) -> str:
         with self._audio_chunks(audio_path) as chunks:
@@ -154,7 +165,11 @@ class AzureOpenAITranscriber(Transcriber):
             raise RuntimeError(
                 "Install FFmpeg and ffprobe and ensure both are accessible on PATH."
             )
-        with tempfile.TemporaryDirectory(prefix="morningtalk-") as directory:
+        temp_root = get_workspace_root() / "temp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="morningtalk-", dir=temp_root
+        ) as directory:
             total_duration = self._probe_duration(audio_path)
             chunks: list[Path] = []
             starts = [0.0]
@@ -198,6 +213,8 @@ class AzureOpenAITranscriber(Transcriber):
             )
             params = {"api-version": self._config.transcription_api_version}
             data = {"language": "th"}
+        if self._factory_vocabulary is not None:
+            data["prompt"] = build_transcription_prompt(self._factory_vocabulary)
         with audio_path.open("rb") as audio_file:
             try:
                 response = self._session.post(

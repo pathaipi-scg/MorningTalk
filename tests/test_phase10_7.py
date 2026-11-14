@@ -238,13 +238,20 @@ def test_overlap_aware_chunk_count_matches_transcriber_algorithm(duration, expec
 
 def test_request_budget_is_checked_before_network_dispatch(tmp_path):
     manifest_path = tmp_path / "manifest.json"
-    manifest = {"request_attempts": []}
+    manifest = {
+        "request_attempts": [],
+        "paths": {"response_root": str(tmp_path / "raw_responses")},
+    }
     calls = []
+    response_body = b'{"usage":{"input_tokens":12,"output_tokens":5,"total_tokens":17}}'
 
     class Session:
         def post(self, url, **kwargs):
             calls.append((url, kwargs))
-            return SimpleNamespace(status_code=200)
+            return SimpleNamespace(
+                status_code=200,
+                content=response_body,
+            )
 
     recording = {"recording_relative_path": "Sep26\\meeting.mp3"}
     tracker = pilot._TrackedSession(
@@ -264,6 +271,13 @@ def test_request_budget_is_checked_before_network_dispatch(tmp_path):
     assert len(calls) == 1
     assert calls[0][1]["allow_redirects"] is False
     assert manifest["request_attempts"][0]["status"] == "response_received"
+    attempt = manifest["request_attempts"][0]
+    raw_response = Path(attempt["raw_response_path"])
+    assert raw_response.read_bytes() == response_body
+    assert attempt["raw_response_sha256"]
+    assert attempt["input_tokens"] == 12
+    assert attempt["output_tokens"] == 5
+    assert attempt["total_tokens"] == 17
 
 
 def test_interrupted_dispatches_become_unknown_and_require_reconciliation(
@@ -308,7 +322,7 @@ def _install_fake_pipeline(
             call_log.append(url)
             if fail_transcription:
                 raise requests.exceptions.ReadTimeout("simulated timeout")
-            return SimpleNamespace(status_code=200)
+            return SimpleNamespace(status_code=200, content=b"{}")
 
         def close(self):
             pass

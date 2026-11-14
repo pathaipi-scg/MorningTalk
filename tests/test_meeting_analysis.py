@@ -15,6 +15,7 @@ from app.meeting_analysis import (
     MeetingAnalysis,
     MeetingAnalysisError,
 )
+import app.meeting_outputs as meeting_outputs
 from app.meeting_outputs import meeting_pdf_paths, write_meeting_pdfs
 import app.file_manager as file_manager
 from app.pdf_export import write_meeting_summary_pdf
@@ -455,6 +456,56 @@ def test_summary_pdf_contains_topic_structure_without_repeating_evidence_quotes(
     assert round(float(page.mediabox.height), 1) == 841.9
 
 
+def test_evidence_validated_review_draft_can_be_replaced_but_empty_review_cannot(
+    tmp_path: Path,
+):
+    source = tmp_path / "meeting-20261107-0817.mp3"
+    source.write_bytes(b"fixture")
+    evidence = (EvidenceReference(1, "ตรวจ Encoder Lot 123"),)
+    analysis = MeetingAnalysis(
+        overview=AnalysisItem("ตรวจ Encoder Lot 123", evidence),
+        classifications=(),
+        key_issues=(),
+        actions=(),
+        dependencies=(),
+        schedules=(),
+        risks=(),
+        status="validated",
+    )
+    pdf = tmp_path / "meeting-20261107-0817_Summary_Draft.pdf"
+    write_meeting_summary_pdf(pdf, source, "CB", analysis, draft=True)
+
+    reviewable = MeetingAnalysis(
+        overview=analysis.overview,
+        classifications=(),
+        key_issues=(),
+        actions=(),
+        dependencies=(),
+        schedules=(),
+        risks=(),
+        status="review_required",
+        review_reason="SemanticReviewRequired",
+    )
+    write_meeting_summary_pdf(
+        pdf, source, "CB", reviewable, overwrite=True, draft=True
+    )
+    text = "\n".join(
+        page.extract_text() or "" for page in PdfReader(str(pdf)).pages
+    )
+    assert "DRAFT - NOT APPROVED" in text
+    assert "SemanticReviewRequired" in text
+
+    with pytest.raises(ValueError, match="evidence-validated analysis"):
+        write_meeting_summary_pdf(
+            pdf,
+            source,
+            "CB",
+            MeetingAnalysis.for_review("InvalidAnalysis"),
+            overwrite=True,
+            draft=True,
+        )
+
+
 def test_summary_pdf_displays_explicit_owner_and_deadline(tmp_path: Path):
     source = tmp_path / "meeting-20261107-0817.mp3"
     source.write_bytes(b"fixture")
@@ -541,6 +592,8 @@ def test_summary_and_full_outputs_are_independent_and_existing_files_are_preserv
     source = tmp_path / "CB" / "Nov26" / "meeting.mp3"
     source.parent.mkdir(parents=True)
     monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
+    monkeypatch.setattr(meeting_outputs, "DEFAULT_PREVIEW_ROOT", tmp_path / "previews")
+    monkeypatch.setattr(meeting_outputs, "DEFAULT_TEMP_ROOT", tmp_path / "temp")
     source.write_bytes(b"fixture")
     summary, full = meeting_pdf_paths(source)
     summary.parent.mkdir(parents=True)
@@ -555,15 +608,20 @@ def test_summary_and_full_outputs_are_independent_and_existing_files_are_preserv
 
     outputs = write_meeting_pdfs(source, "CB", transcript, analysis)
 
-    assert outputs.summary.status == "existing"
-    assert outputs.full_transcript.status == "created"
+    assert outputs.summary.status == "not_published"
+    assert outputs.full_transcript.status == "not_published"
     assert summary.read_bytes() == before
-    assert full.is_file()
+    assert not full.exists()
 
 
-def test_fixture_pdf_pair_is_marked_as_fixture_and_never_uses_azure(tmp_path: Path):
+def test_fixture_pdf_pair_is_marked_as_fixture_and_never_uses_azure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     from app.phase9 import run_fixture_preview
 
+    monkeypatch.setattr(meeting_outputs, "DEFAULT_PREVIEW_ROOT", tmp_path / "previews")
+    monkeypatch.setattr(meeting_outputs, "DEFAULT_TEMP_ROOT", tmp_path / "temp")
     summary = run_fixture_preview(tmp_path)
     full = summary.with_name(summary.name.replace("_Summary_Draft.pdf", "_Full.pdf"))
     summary_text = "\n".join(
