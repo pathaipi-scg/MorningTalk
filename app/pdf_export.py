@@ -2,8 +2,10 @@
 
 from pathlib import Path
 import os
+import re
 import tempfile
 
+from pypdf import PdfReader, apply_configuration
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
@@ -14,6 +16,47 @@ from xml.sax.saxutils import escape
 from app.file_manager import meeting_datetime
 from app.meeting_analysis import AnalysisItem, EvidenceReference, MeetingAnalysis
 from app.transcript import TranscriptDocument
+
+
+def _normalized_text(value: str) -> str:
+    return re.sub(r"\s+", "", value)
+
+
+def _extract_pdf_text(path: Path) -> tuple[int, str]:
+    with apply_configuration(disable_legacy_handling=True):
+        reader = PdfReader(str(path))
+        page_texts = []
+        for page_number, page in enumerate(reader.pages, 1):
+            lines = (page.extract_text() or "").splitlines()
+            if lines and lines[0].strip() == str(page_number):
+                lines = lines[1:]
+            page_texts.append("\n".join(lines))
+        return len(reader.pages), "\n".join(page_texts)
+
+
+def _validate_pdf(path: Path, expected_texts: tuple[str, ...] = ()) -> None:
+    page_count, extracted_text = _extract_pdf_text(path)
+    extracted = _normalized_text(extracted_text)
+    position = 0
+    for expected in expected_texts:
+        normalized = _normalized_text(expected)
+        if not normalized:
+            continue
+        position = extracted.find(normalized, position)
+        if position < 0:
+            raise ValueError("Generated PDF does not contain the complete transcript.")
+        position += len(normalized)
+    if not page_count:
+        raise ValueError("Generated PDF contains no pages.")
+
+
+def _publish_pdf(temporary: Path, path: Path, *, overwrite: bool) -> None:
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"PDF already exists: {path.name}")
+    if overwrite:
+        os.replace(temporary, path)
+    else:
+        temporary.rename(path)
 
 
 def _thai_font() -> str:
@@ -80,10 +123,8 @@ def write_pdf(path: Path, source: Path, plant: str, transcript: str, *, overwrit
         SimpleDocTemplate(str(temporary), pagesize=A4, title=f"Transcript: {source.name}").build(
             story, onFirstPage=add_page_number, onLaterPages=add_page_number
         )
-        if overwrite:
-            os.replace(temporary, path)
-        else:
-            temporary.rename(path)
+        _validate_pdf(temporary, tuple(transcript.splitlines()))
+        _publish_pdf(temporary, path, overwrite=overwrite)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -183,10 +224,11 @@ def write_transcript_pdf(
             topMargin=54,
             bottomMargin=42,
         ).build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
-        if overwrite:
-            os.replace(temporary, path)
-        else:
-            temporary.rename(path)
+        _validate_pdf(
+            temporary,
+            tuple(segment.display_text for segment in document.segments),
+        )
+        _publish_pdf(temporary, path, overwrite=overwrite)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -199,11 +241,14 @@ def write_meeting_summary_pdf(
     *,
     overwrite: bool = False,
     fixture_preview: bool = False,
+    draft: bool = False,
     demo_passages: tuple[EvidenceReference, ...] = (),
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
         raise FileExistsError(f"PDF already exists: {path.name}")
+    if overwrite and draft and analysis.status != "validated":
+        raise ValueError("An existing summary draft can only be replaced by validated analysis.")
     font = _thai_font()
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.stem}.", suffix=".tmp.pdf", dir=path.parent
@@ -272,6 +317,11 @@ def write_meeting_summary_pdf(
     if fixture_preview:
         story.append(Paragraph(
             "ตัวอย่างจัดหน้าเท่านั้น — ไม่ใช่สรุป AI ที่ผ่านการตรวจสอบ",
+            body,
+        ))
+    if draft:
+        story.append(Paragraph(
+            "DRAFT - NOT APPROVED / ร่าง - ยังไม่ได้รับอนุมัติ",
             body,
         ))
     if analysis.status != "validated" and not demo_passages:
@@ -374,9 +424,11 @@ def write_meeting_summary_pdf(
             topMargin=58,
             bottomMargin=42,
         ).build(story, onFirstPage=add_page_number, onLaterPages=add_page_number)
-        if overwrite:
-            os.replace(temporary, path)
-        else:
-            temporary.rename(path)
+        _validate_pdf(temporary)
+        if draft:
+            _page_count, draft_text = _extract_pdf_text(temporary)
+            if "DRAFT - NOT APPROVED" not in draft_text.upper():
+                raise ValueError("Generated summary draft is missing its DRAFT label.")
+        _publish_pdf(temporary, path, overwrite=overwrite)
     finally:
         temporary.unlink(missing_ok=True)

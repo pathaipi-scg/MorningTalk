@@ -609,7 +609,7 @@ def test_fixture_preview_does_not_make_azure_calls(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(phase9, "TranscriptCleanup", forbidden)
 
     summary = phase9.run_fixture_preview(tmp_path)
-    full = summary.with_name(f"{summary.stem}_Full.pdf")
+    full = summary.with_name(summary.name.replace("_Summary_Draft.pdf", "_Full.pdf"))
     summary_text = "\n".join(
         page.extract_text() or "" for page in PdfReader(str(summary)).pages
     )

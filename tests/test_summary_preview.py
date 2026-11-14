@@ -6,6 +6,7 @@ import pytest
 from pypdf import PdfReader
 
 from app.file_manager import source_fingerprint
+import app.file_manager as file_manager
 from app.main import main
 from app.summary_preview import (
     SummaryPreviewNotReady,
@@ -75,16 +76,18 @@ def _write_phase9_json(tmp_path: Path, source: Path, *, analysis_status="validat
     return path, payload
 
 
-def test_offline_summary_preview_renders_only_validated_evidence(tmp_path: Path):
+def test_offline_summary_preview_renders_only_validated_evidence(tmp_path: Path, monkeypatch):
     source = tmp_path / "CB" / "Nov26" / "meeting-20261107-0817.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"fixture source")
+    output_root = tmp_path / "Transcript"
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", output_root)
     json_path, _payload = _write_phase9_json(tmp_path, source)
-    output_dir = tmp_path / "summary-preview"
+    output_dir = output_root / "CB" / "Nov26"
 
     output = write_sara_summary_preview(json_path, source, output_dir)
 
-    assert output.name == "meeting-20261107-0817_SARA_Preview.pdf"
+    assert output.name == "meeting-20261107-0817_Summary_Draft.pdf"
     assert output.is_file()
     reader = PdfReader(str(output))
     extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -92,6 +95,7 @@ def test_offline_summary_preview_renders_only_validated_evidence(tmp_path: Path)
     assert "ภาพรวมการประชุม" in extracted
     assert "หมวดหมู่การประชุม" in extracted
     assert "ตรวจสอบ Encoder Lot 123" in extracted
+    assert "DRAFT - NOT APPROVED" in extracted
 
 
 def test_offline_summary_preview_refuses_unvalidated_analysis_without_placeholder(
@@ -154,19 +158,26 @@ def test_offline_summary_preview_refuses_inconsistent_transcript(tmp_path: Path)
         write_sara_summary_preview(json_path, source, tmp_path / "preview")
 
 
-def test_offline_summary_preview_never_overwrites_existing_pdf(tmp_path: Path):
-    source = tmp_path / "meeting.mp3"
+def test_offline_summary_preview_atomically_replaces_existing_draft(tmp_path: Path, monkeypatch):
+    source = tmp_path / "CB" / "Nov26" / "meeting.mp3"
+    source.parent.mkdir(parents=True)
     source.write_bytes(b"fixture source")
+    output_root = tmp_path / "Transcript"
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", output_root)
     json_path, _payload = _write_phase9_json(tmp_path, source)
-    output_dir = tmp_path / "preview"
-    output_dir.mkdir()
-    output = output_dir / "meeting_SARA_Preview.pdf"
-    output.write_bytes(b"preserve")
+    output_dir = output_root / "CB" / "Nov26"
+    output_dir.mkdir(parents=True)
+    output = output_dir / "meeting_Summary_Draft.pdf"
+    output.write_bytes(b"stale draft")
 
-    with pytest.raises(FileExistsError):
-        write_sara_summary_preview(json_path, source, output_dir)
+    generated = write_sara_summary_preview(json_path, source, output_dir)
 
-    assert output.read_bytes() == b"preserve"
+    assert generated == output
+    assert output.read_bytes().startswith(b"%PDF")
+    extracted = "\n".join(
+        page.extract_text() or "" for page in PdfReader(str(output)).pages
+    )
+    assert "DRAFT - NOT APPROVED" in extracted
 
 
 def test_cli_blocks_v3_placeholder_without_creating_summary(tmp_path: Path):

@@ -11,6 +11,8 @@ from app.monitor import (
     run_monitor,
 )
 from app.scanner import scan_directory
+from app.file_manager import pdf_path_for_source
+import app.file_manager as file_manager
 from app.auto_scan import synchronize_scan
 from unittest.mock import Mock
 
@@ -94,7 +96,7 @@ def test_monitor_lock_prevents_a_second_live_instance(tmp_path: Path):
         Path("CB") / "Jan27" / "meeting.mp3",
         Path("CB") / "2027" / "Jan" / "meeting.mp3",
         Path("CB") / "2027" / "Feb" / "meeting.mp3",
-        Path("arbitrary") / "nesting" / "depth" / "meeting.mp3",
+        Path("CB") / "Dec26" / "Archive" / "meeting.mp3",
     ],
 )
 def test_scanner_discovers_calendar_and_arbitrarily_nested_folders(
@@ -109,14 +111,17 @@ def test_scanner_discovers_calendar_and_arbitrarily_nested_folders(
     items = scan_directory(root, stability_interval_seconds=0)
 
     assert [item.path for item in items] == [source]
-    assert items[0].pdf_path == source.with_suffix(".pdf")
+    assert items[0].pdf_path == pdf_path_for_source(source)
 
 
 def test_same_mp3_basename_in_different_folders_is_tracked_by_full_path(
     tmp_path: Path, monkeypatch,
 ):
     root = tmp_path / "Record File"
-    sources = [root / folder / "meeting.mp3" for folder in ("first", "second")]
+    sources = [
+        root / folder / "Nov26" / "meeting.mp3"
+        for folder in ("first", "second")
+    ]
     for source in sources:
         source.parent.mkdir(parents=True)
         source.write_bytes(b"audio")
@@ -126,7 +131,7 @@ def test_same_mp3_basename_in_different_folders_is_tracked_by_full_path(
 
     assert [item.path for item in items] == sorted(sources)
     assert len({str(item.path.resolve()).casefold() for item in items}) == 2
-    assert all(item.pdf_path == item.path.with_suffix(".pdf") for item in items)
+    assert all(item.pdf_path == pdf_path_for_source(item.path) for item in items)
 
 
 def test_monitor_scan_discovers_folder_created_after_monitor_start(
@@ -148,7 +153,7 @@ def test_partially_copied_mp3_is_marked_unstable_and_not_synchronized(
     tmp_path: Path, monkeypatch,
 ):
     root = tmp_path / "Record File"
-    source = root / "nested" / "copy.mp3"
+    source = root / "CB" / "Nov26" / "nested" / "copy.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"partial")
     monkeypatch.setattr("app.scanner.is_file_stable", lambda *_args: False)
@@ -193,13 +198,19 @@ def test_monitor_retries_after_temporary_database_failure(
 def test_new_mp3_is_queued_in_database_and_existing_pdf_is_untouched(
     tmp_path: Path, monkeypatch,
 ):
+    monkeypatch.setattr(
+        file_manager,
+        "DEFAULT_TRANSCRIPT_ROOT",
+        tmp_path / "Transcript",
+    )
     root = tmp_path / "input"
-    new_source = root / "Site" / "Month" / "new.mp3"
-    old_source = root / "Site" / "Month" / "review.mp3"
+    new_source = root / "Site" / "Nov26" / "new.mp3"
+    old_source = root / "Site" / "Nov26" / "review.mp3"
     new_source.parent.mkdir(parents=True)
     new_source.write_bytes(b"new audio")
     old_source.write_bytes(b"old audio")
-    old_pdf = old_source.with_suffix(".pdf")
+    old_pdf = pdf_path_for_source(old_source)
+    old_pdf.parent.mkdir(parents=True)
     old_pdf.write_bytes(b"preserve this pdf")
     pdf_before = old_pdf.read_bytes()
     monkeypatch.setattr("app.scanner.is_file_stable", lambda *_args: True)
@@ -216,4 +227,4 @@ def test_new_mp3_is_queued_in_database_and_existing_pdf_is_untouched(
     assert first_scan_args[1] == items[0].fingerprint
     assert first_scan_args[2] == new_source.stat().st_size
     assert old_pdf.read_bytes() == pdf_before
-    assert not new_source.with_suffix(".pdf").exists()
+    assert not pdf_path_for_source(new_source).exists()

@@ -1,6 +1,6 @@
 # MorningTalk
 
-MorningTalk discovers meeting MP3 files recursively and can create a Thai Unicode meeting-summary PDF and a separate full-transcript PDF beside each source MP3. Summary claims are evidence-linked internally and remain review-required unless transcript cleanup and analysis validation succeed. The application does not create persistent TXT files.
+MorningTalk discovers meeting MP3 files recursively and writes user-facing TXT and PDF outputs to `D:\KM\Vault\MorningTalk\Transcript\<Plant>\<MonthYY>\`. Summary claims are evidence-linked internally and remain review-required unless transcript cleanup and analysis validation succeed. Internal JSON, request metadata, and review state stay in the private application workspace.
 
 ## Setup
 
@@ -15,7 +15,7 @@ Configuration can be checked locally by importing `get_azure_config()` and calli
 .\.venv\Scripts\python.exe -m app.main --file "D:\path\meeting-20261104-0815.mp3" --input-dir "D:\path"
 ```
 
-An existing PDF is skipped. Use `--force` to intentionally regenerate it. PDF creation uses a temporary file in the source directory and atomically publishes the finished document. Exclusive per-source lock files prevent concurrent runs from processing the same MP3. Source MP3 files are read-only to the application.
+Existing Transcript outputs can be regenerated with `--force`. TXT and PDFs are written to temporary files in the destination directory, validated, and atomically replaced; a failed write or validation leaves the previous output intact. Replacing an existing summary draft requires newly validated analysis, and an approved summary is written only after explicit human approval. Exclusive per-source lock files prevent concurrent runs from processing the same MP3. Source MP3 files are read-only to the application.
 
 Audio is segmented across the complete timeline into 180-second chunks with ten seconds of overlap by default. Configure `MORNINGTALK_CHUNK_DURATION_SECONDS`, `MORNINGTALK_CHUNK_OVERLAP_SECONDS`, and `MORNINGTALK_QUALITY_WARNING_CHARS_PER_MINUTE` in `.env` if needed. Chunks are sent and assembled chronologically; only verified matching text at boundaries is deduplicated. Empty or failed chunks fail the file rather than being silently omitted. Logs include chunk durations, status, and character counts, never transcript text. A transcript below the conservative default of ten characters per minute triggers a quality warning, not an automatic rejection. Chunk sizing is checked against the API request limit. Install FFmpeg and ffprobe and ensure they are available on `PATH`. The transcription request sends MP3 as multipart data with a Thai language hint and relies on the endpoint's default JSON response. A future adapter may implement offline faster-whisper through the `Transcriber` interface.
 
@@ -74,7 +74,7 @@ Generate a clearly marked local fixture preview without Azure or MSSQL:
 
 The paired PDFs are written to a timestamped filename pair in `%LOCALAPPDATA%\MorningTalk\previews\`; fixture text and analysis are visibly marked as demonstrations. Existing preview PDFs are never overwritten.
 
-Before the controlled live test, a DBA must review and apply the additive, idempotent, transactional `migrations/002_phase9_transcripts.sql` and `migrations/003_meeting_summary_outputs.sql` migrations on SQL Server 2025 only. Together, they add separate raw/cleaned transcript, analysis, segment JSON, output paths/statuses, review, and token-usage columns; the application does not apply DDL. Follow [the Phase 9 DBA runbook](./migrations/PHASE9_DBA_EXECUTION.md). Confirm Speech resource support and the exact GPT deployment/API version first. The live test is restricted to `meeting-20261107-0817.mp3`, writes separate preview artifacts using the production basenames, does not overwrite adjacent PDFs, and requires explicit Azure billing and MSSQL write flags:
+Before the controlled live test, a DBA must review and apply the additive, idempotent, transactional `migrations/002_phase9_transcripts.sql` and `migrations/003_meeting_summary_outputs.sql` migrations on SQL Server 2025 only. Together, they add separate raw/cleaned transcript, analysis, segment JSON, output paths/statuses, review, and token-usage columns; the application does not apply DDL. Follow [the Phase 9 DBA runbook](./migrations/PHASE9_DBA_EXECUTION.md). Confirm Speech resource support and the exact GPT deployment/API version first. The live test is restricted to `meeting-20261107-0817.mp3`, writes user-facing outputs under the Transcript folder using the production basenames, atomically replaces generated transcript outputs, and requires explicit Azure billing and MSSQL write flags:
 
 ```powershell
 .\.venv\Scripts\python.exe -m app.main phase9-live-test --confirm-azure-billing --confirm-mssql-write --preview-dir "$env:LOCALAPPDATA\MorningTalk\previews\live-test-20261107"

@@ -8,7 +8,13 @@ import sys
 from app.auto_scan import process_scanned_file, synchronize_scan
 from app.config import DEFAULT_INPUT_DIR, get_azure_config, get_sql_config
 from app.database import AudioRecord, SqlRepository, connect_sql
-from app.file_manager import discover_mp3_files, pdf_path_for_source, source_fingerprint, source_processing_lock
+from app.file_manager import (
+    discover_mp3_files,
+    pdf_path_for_source,
+    resolve_meeting_output_paths,
+    source_fingerprint,
+    source_processing_lock,
+)
 from app.monitor import run_monitor
 from app.pdf_export import write_pdf
 from app.phase10 import (
@@ -52,13 +58,19 @@ from app.summary_preview import (
     write_sara_summary_preview,
 )
 from app.transcriber import AzureOpenAITranscriber, estimate_chunk_count
+from app.meeting_outputs import write_transcript_text
 
 
 def process_file(source: Path, input_dir: Path, transcriber, force: bool = False) -> bool:
-    pdf_path = pdf_path_for_source(source)
+    output_paths = resolve_meeting_output_paths(source)
+    pdf_path = output_paths.full_transcript_pdf
     with source_processing_lock(source):
-        if pdf_path.exists() and not force:
-            logging.info("Skipping existing PDF: %s", pdf_path)
+        if not force and (pdf_path.exists() or output_paths.transcript_text.exists()):
+            logging.info(
+                "Skipping existing transcript output; use --force to replace atomically: text=%s full_pdf=%s",
+                output_paths.transcript_text,
+                pdf_path,
+            )
             return False
         if not source.is_file() or source.stat().st_size == 0:
             raise ValueError(f"Input is missing or empty: {source}")
@@ -66,10 +78,16 @@ def process_file(source: Path, input_dir: Path, transcriber, force: bool = False
         transcript = transcriber.transcribe(source)
         if not transcript.strip():
             raise ValueError(f"Transcription returned no text for {source.name}")
-        plant = source.relative_to(input_dir).parts[0] if source.relative_to(input_dir).parts else ""
+        plant = source.parent.parent.name
         if source_fingerprint(source) != original_fingerprint:
             raise RuntimeError(f"Source MP3 changed during processing: {source.name}")
-        write_pdf(pdf_path, source, plant, transcript, overwrite=force)
+        output_paths.directory.mkdir(parents=True, exist_ok=True)
+        write_transcript_text(
+            output_paths.transcript_text,
+            transcript,
+            overwrite=True,
+        )
+        write_pdf(pdf_path, source, plant, transcript, overwrite=True)
     logging.info("Completed: %s", source)
     return True
 
@@ -96,8 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--file", type=Path, help="Process one MP3 file.")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
-    parser.add_argument("--dry-run", action="store_true", help="List expected adjacent PDFs without calling Azure.")
-    parser.add_argument("--force", action="store_true", help="Reprocess even if outputs are current.")
+    parser.add_argument("--dry-run", action="store_true", help="List expected Transcript-folder PDFs without calling Azure.")
+    parser.add_argument("--force", action="store_true", help="Reprocess and atomically replace existing transcript outputs.")
     parser.add_argument("--sync-db", action="store_true", help="Persist scan state to MSSQL.")
     parser.add_argument("--process", action="store_true", help="Explicitly opt in to Azure processing.")
     parser.add_argument("--interval", type=int, default=300, help="Monitor interval in seconds.")
@@ -128,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--summary-output-dir",
         type=Path,
-        help="Directory for a new <basename>_SARA_Preview.pdf output.",
+        help="Must match the resolved Transcript output directory for the recording.",
     )
     parser.add_argument(
         "--confirm-azure-billing",
@@ -168,7 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable an interactive confirmation prompt for review or PDF approval.",
     )
     parser.add_argument("--generate-approved-pdf", action="store_true")
-    parser.add_argument("--approved-pdf-output-dir", type=Path)
+    parser.add_argument(
+        "--approved-pdf-output-dir",
+        type=Path,
+        help="Must be the resolved Transcript output directory for this recording.",
+    )
     parser.add_argument("--pilot-manifest", type=Path, default=PILOT_MANIFEST_PATH)
     parser.add_argument("--pilot-report", type=Path, default=PILOT_REPORT_PATH)
     parser.add_argument("--pilot-stage-root", type=Path, default=PILOT_STAGE_ROOT)
@@ -213,6 +235,7 @@ def _scan_once(
     sync_db: bool,
     process_enabled: bool,
     files: list[Path] | None = None,
+    force: bool = False,
 ) -> int:
     repository = None
     connection = None
@@ -236,13 +259,15 @@ def _scan_once(
             failed = 0
             updated = []
             for item, audio_file_id, status in states:
-                full_pdf = item.path.with_name(f"{item.path.stem}_Full.pdf")
+                full_pdf = item.pdf_path
                 needs_missing_output = (
                     status == "review_required" and not full_pdf.exists()
                 )
+                force_reviewed_output = force and status == "review_required"
                 if audio_file_id is None or (
                     status not in {"discovered", "modified", "failed"}
                     and not needs_missing_output
+                    and not force_reviewed_output
                 ):
                     updated.append((item, audio_file_id, status))
                     continue
@@ -253,7 +278,9 @@ def _scan_once(
                         audio_file_id,
                         repository,
                         azure_config,
-                        allow_review_required=needs_missing_output,
+                        allow_review_required=(
+                            needs_missing_output or force_reviewed_output
+                        ),
                     )
                 except Exception as error:
                     failed += 1
@@ -295,8 +322,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "monitor":
         try:
+            def scan_cycle(directory: Path, **options) -> int:
+                if args.force:
+                    options["force"] = True
+                return _scan_once(directory, **options)
+
             return run_monitor(
-                lambda directory, **options: _scan_once(directory, **options),
+                scan_cycle,
                 args.input_dir.resolve(),
                 interval_seconds=args.interval,
                 local_only=args.local_only,
@@ -451,11 +483,6 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.decision and not args.item_id:
             logging.error("--decision requires --item-id.")
-            return 2
-        if args.generate_approved_pdf and not args.approved_pdf_output_dir:
-            logging.error(
-                "--generate-approved-pdf requires --approved-pdf-output-dir."
-            )
             return 2
         edits: dict[str, str | None] = {}
         if args.edit_text is not None:
@@ -718,7 +745,13 @@ def main(argv: list[str] | None = None) -> int:
         else:
             input_dir = args.input_dir.resolve()
             files = [args.file.resolve()] if args.file else None
-            return _scan_once(input_dir, sync_db=True, process_enabled=True, files=files)
+            return _scan_once(
+                input_dir,
+                sync_db=True,
+                process_enabled=True,
+                files=files,
+                force=args.force,
+            )
     if args.command == "status":
         return _show_status()
     if args.command == "scan-once":
@@ -726,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input_dir.resolve(),
             sync_db=args.sync_db or args.process,
             process_enabled=args.process,
+            force=args.force,
         )
     try:
         if args.file:

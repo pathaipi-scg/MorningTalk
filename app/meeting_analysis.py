@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 import unicodedata
 
 import requests
@@ -154,7 +154,12 @@ class GPTMeetingAnalyzer:
         self._session = session
         self._terminology = terminology
 
-    def analyze(self, segments: tuple[TranscriptSegment, ...]) -> MeetingAnalysis:
+    def analyze(
+        self,
+        segments: tuple[TranscriptSegment, ...],
+        *,
+        on_response: Callable[[Any], None] | None = None,
+    ) -> MeetingAnalysis:
         source = {
             "segments": [
                 {
@@ -303,6 +308,8 @@ class GPTMeetingAnalyzer:
             raise MeetingAnalysisError(
                 f"Meeting analysis request failed; error_class={type(error).__name__}."
             ) from None
+        if on_response is not None:
+            on_response(response)
         if not 200 <= response.status_code < 300:
             log_azure_error(
                 logger, response, endpoint.url, self._config.text_deployment, endpoint.api_mode

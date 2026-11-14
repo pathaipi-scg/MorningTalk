@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 import app.phase9 as phase9
+import app.file_manager as file_manager
 from app.database import SavedTranscriptRecord
 from app.meeting_analysis import AnalysisItem, EvidenceReference, MeetingAnalysis
 from app.meeting_outputs import MeetingPdfOutputs, PdfOutputStatus, meeting_pdf_paths
@@ -38,6 +39,11 @@ def _setup_resume(tmp_path: Path, monkeypatch, *, fingerprint=None, cleanup_rais
     )
     preview_root = tmp_path / "previews"
     monkeypatch.setattr(phase9, "PREVIEW_DIRECTORY", preview_root)
+    monkeypatch.setattr(
+        file_manager,
+        "DEFAULT_TRANSCRIPT_ROOT",
+        tmp_path / "Transcript",
+    )
     output_dir = preview_root / "resume-v1"
     monkeypatch.setattr(
         phase9,
@@ -101,7 +107,7 @@ def _setup_resume(tmp_path: Path, monkeypatch, *, fingerprint=None, cleanup_rais
 
     output_calls = []
 
-    def fake_write(source_path, _plant, transcript, meeting_analysis, *, output_dir):
+    def fake_write(source_path, _plant, transcript, meeting_analysis, *, output_dir=None):
         paths = meeting_pdf_paths(source_path, output_dir)
         output_calls.append((transcript, meeting_analysis, paths))
         return MeetingPdfOutputs(
@@ -140,9 +146,9 @@ def test_resume_uses_saved_transcript_and_never_calls_transcriber(tmp_path, monk
     assert transcript.raw_transcript == record.raw_transcript
     assert transcript.segments[0].speaker_id is None
     assert analysis.status == "validated"
-    assert summary.name == "meeting-20261107-0817.pdf"
+    assert summary.name == "meeting-20261107-0817_Summary_Draft.pdf"
     assert full.name == "meeting-20261107-0817_Full.pdf"
-    assert summary.parent == full.parent == output_dir
+    assert summary.parent == full.parent == tmp_path / "Transcript" / "CB" / "Nov26"
     assert outputs.summary.status == outputs.full_transcript.status == "created"
     assert len(output_calls) == 1
     transcriber.transcribe.assert_not_called()
@@ -161,6 +167,23 @@ def test_resume_uses_saved_transcript_and_never_calls_transcriber(tmp_path, monk
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["source_fingerprint"] == record.fingerprint
     assert payload["raw_transcript"] == record.raw_transcript
+
+
+def test_resume_allows_replacing_existing_transcript_folder_pdfs(tmp_path, monkeypatch):
+    (
+        input_dir, source, output_dir, _record, _connection, _repository,
+        output_calls, _transcriber,
+    ) = _setup_resume(tmp_path, monkeypatch)
+    paths = file_manager.resolve_meeting_output_paths(source)
+    paths.directory.mkdir(parents=True)
+    paths.summary_draft_pdf.write_bytes(b"old draft")
+    paths.full_transcript_pdf.write_bytes(b"old full transcript")
+
+    summary, full, *_ = _run(input_dir, output_dir)
+
+    assert summary == paths.summary_draft_pdf
+    assert full == paths.full_transcript_pdf
+    assert len(output_calls) == 1
 
 
 def test_resume_rejects_source_fingerprint_mismatch_before_claim_or_api(

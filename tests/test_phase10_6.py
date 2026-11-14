@@ -8,6 +8,7 @@ import pytest
 from pypdf import PdfReader
 
 import app.phase10_6 as phase10_6
+import app.file_manager as file_manager
 from app.file_manager import source_fingerprint
 from app.main import main
 from app.phase10_6 import (
@@ -224,6 +225,7 @@ def test_transcript_hash_change_is_rejected_before_review(tmp_path):
 def test_approved_pdf_requires_every_decision_and_excludes_rejected_items(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     bundle = _bundle(tmp_path)
     state = _decide(bundle, "overview:1")
     state = _decide(bundle, "topics:1")
@@ -233,9 +235,11 @@ def test_approved_pdf_requires_every_decision_and_excludes_rejected_items(
     )
     assert state["status"] == "review_approved"
 
-    preview_root = tmp_path / "previews"
-    monkeypatch.setattr(phase10_6, "DEFAULT_PREVIEW_ROOT", preview_root)
-    output_dir = preview_root / "approved-meeting"
+    output_dir = tmp_path / "Transcript" / "CB" / "Nov26"
+    assert not (output_dir / "meeting_Summary.pdf").exists()
+    output_dir.mkdir(parents=True)
+    existing_pdf = output_dir / "meeting_Summary.pdf"
+    existing_pdf.write_bytes(b"stale approved PDF")
     pdf = generate_approved_pdf(
         bundle,
         state,
@@ -251,18 +255,18 @@ def test_approved_pdf_requires_every_decision_and_excludes_rejected_items(
     assert "ส่งอะไหล่" not in extracted
     assert state["items"]["actions:1"]["decision"] == "rejected"
 
-    with pytest.raises(ReviewWorkflowError, match="ApprovedPdfDirectoryAlreadyExists"):
-        generate_approved_pdf(bundle, state, output_dir, confirmed=True)
+    assert generate_approved_pdf(bundle, state, output_dir, confirmed=True) == pdf
 
 
-def test_approved_pdf_cannot_be_written_beside_production_source(tmp_path):
+def test_approved_pdf_cannot_be_written_outside_transcript_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     bundle = _bundle(tmp_path)
     state = _decide(bundle, "overview:1")
     state = _decide(bundle, "topics:1")
     state = _decide(bundle, "key_issues:1")
     _decide(bundle, "actions:1", "reject", reason="Not sufficiently clear.")
 
-    with pytest.raises(ReviewWorkflowError, match="ApprovedPdfOutsidePreviewRoot"):
+    with pytest.raises(ReviewWorkflowError, match="ApprovedPdfOutsideTranscriptRoot"):
         generate_approved_pdf(
             bundle,
             state,
@@ -270,6 +274,18 @@ def test_approved_pdf_cannot_be_written_beside_production_source(tmp_path):
             confirmed=True,
         )
     assert not (bundle.source.parent / "approved").exists()
+
+
+def test_final_summary_pdf_is_not_created_before_human_approval(tmp_path, monkeypatch):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
+    bundle = _bundle(tmp_path)
+    paths = file_manager.resolve_meeting_output_paths(bundle.source)
+
+    assert not paths.approved_summary_pdf.exists()
+    state = phase10_6._load_or_start_review(bundle, "tester", start_if_missing=True)
+    with pytest.raises(ReviewWorkflowError, match="ExplicitHumanConfirmationRequired"):
+        generate_approved_pdf(bundle, state, confirmed=False)
+    assert not paths.approved_summary_pdf.exists()
 
 
 def test_review_audit_tampering_is_rejected(tmp_path):

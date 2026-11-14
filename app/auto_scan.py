@@ -10,7 +10,7 @@ from app.config import AzureConfig, get_azure_openai_api_version
 from app.database import SqlRepository, retry_delay_seconds
 from app.file_manager import source_fingerprint, source_processing_lock
 from app.meeting_analysis import GPTMeetingAnalyzer, MeetingAnalysis, MeetingAnalysisError
-from app.meeting_outputs import meeting_pdf_paths, write_meeting_pdfs
+from app.meeting_outputs import write_meeting_pdfs
 from app.scanner import ScannedAudio
 from app.transcript import TranscriptDocument, TranscriptSegment, mark_for_review, validate_segment_times
 from app.transcript_cleanup import TranscriptCleanup
@@ -49,9 +49,6 @@ def process_scanned_file(
 ) -> str:
     if not item.stable:
         return "unstable"
-    summary_path, full_path = meeting_pdf_paths(item.path)
-    if summary_path.exists() and full_path.exists():
-        return "review_required"
     if not repository.phase9_schema_ready():
         raise RuntimeError(
             "Phase 9 MSSQL migrations 002 and 003 must be applied before Azure processing."
@@ -70,9 +67,6 @@ def process_scanned_file(
 
     try:
         with source_processing_lock(item.path):
-            if summary_path.exists() and full_path.exists():
-                return "review_required"
-
             fingerprint = source_fingerprint(item.path)
 
             def save_chunk(progress: ChunkProgress) -> None:
@@ -170,7 +164,7 @@ def process_scanned_file(
                 config.quality_warning_chars_per_minute
             )
             outputs_validated = all(
-                result.status == "created"
+                result.status in {"created", "overwritten"}
                 for result in (outputs.summary, outputs.full_transcript)
             )
             needs_review = (

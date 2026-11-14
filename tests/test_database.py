@@ -13,6 +13,7 @@ from app.scanner import classify_scanned_file, scan_directory
 from app.database import AudioRecord
 from app.auto_scan import process_scanned_file
 from app.scanner import ScannedAudio
+from app.file_manager import pdf_path_for_source
 import app.auto_scan as auto_scan_module
 from app.transcript import TranscriptDocument, TranscriptSegment
 
@@ -268,7 +269,7 @@ def test_file_status_classification(record, fingerprint, pdf_exists, expected):
 
 def test_scanner_discovers_recursively_and_reports_file_stability(tmp_path: Path, monkeypatch):
     root = tmp_path / "input"
-    source = root / "Site" / "Month" / "meeting.mp3"
+    source = root / "Site" / "Nov26" / "meeting.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"audio")
     monkeypatch.setattr("app.scanner.is_file_stable", lambda *_args: True)
@@ -276,7 +277,7 @@ def test_scanner_discovers_recursively_and_reports_file_stability(tmp_path: Path
     assert len(items) == 1
     assert items[0].status == "new"
     assert items[0].stable
-    assert items[0].pdf_path == source.with_suffix(".pdf")
+    assert items[0].pdf_path == pdf_path_for_source(source)
 
 
 def test_unstable_file_is_never_claimed_for_processing():
@@ -285,7 +286,7 @@ def test_unstable_file_is_never_claimed_for_processing():
 
 def test_failed_processing_does_not_publish_pdf(tmp_path: Path, monkeypatch):
     root = tmp_path / "input"
-    source = root / "Site" / "Month" / "meeting.mp3"
+    source = root / "Site" / "Nov26" / "meeting.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"stable audio")
     item = ScannedAudio(
@@ -293,7 +294,7 @@ def test_failed_processing_does_not_publish_pdf(tmp_path: Path, monkeypatch):
         fingerprint="fingerprint",
         size_bytes=source.stat().st_size,
         modified_utc=datetime.now(timezone.utc),
-        pdf_path=source.with_suffix(".pdf"),
+        pdf_path=pdf_path_for_source(source),
         pdf_exists=False,
         stable=True,
         status="new",

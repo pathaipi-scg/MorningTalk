@@ -13,7 +13,7 @@ import tempfile
 from typing import Any
 import uuid
 
-from app.file_manager import source_fingerprint
+from app.file_manager import resolve_meeting_output_paths, source_fingerprint
 from app.meeting_analysis import (
     AnalysisItem,
     GPTMeetingAnalyzer,
@@ -683,22 +683,16 @@ def _evidence_reference(reference: dict[str, Any], quote: str):
 def generate_approved_pdf(
     bundle: ReviewBundle,
     state: dict[str, Any],
-    output_dir: Path,
+    output_dir: Path | None = None,
     *,
     confirmed: bool = False,
 ) -> Path:
     if not confirmed:
         raise ReviewWorkflowError("ExplicitHumanConfirmationRequired")
-    output_dir = output_dir.resolve()
-    preview_root = DEFAULT_PREVIEW_ROOT.resolve()
-    try:
-        relative = output_dir.relative_to(preview_root)
-    except ValueError as error:
-        raise ReviewWorkflowError("ApprovedPdfOutsidePreviewRoot") from error
-    if not relative.parts:
-        raise ReviewWorkflowError("ApprovedPdfRequiresNewPreviewDirectory")
-    if output_dir.exists():
-        raise ReviewWorkflowError("ApprovedPdfDirectoryAlreadyExists")
+    output_paths = resolve_meeting_output_paths(bundle.source)
+    if output_dir is not None and output_dir.resolve() != output_paths.directory.resolve():
+        raise ReviewWorkflowError("ApprovedPdfOutsideTranscriptRoot")
+    pdf_path = output_paths.approved_summary_pdf
     current_bundle = load_review_bundle(
         bundle.analysis_path,
         bundle.transcript.path,
@@ -718,13 +712,13 @@ def generate_approved_pdf(
     if current_state != state:
         state = current_state
     analysis = _approved_analysis(current_bundle, state)
-    output_dir.mkdir(parents=True, exist_ok=False)
-    pdf_path = output_dir / f"{bundle.source.stem}_SARA_Approved.pdf"
+    output_paths.directory.mkdir(parents=True, exist_ok=True)
     write_meeting_summary_pdf(
         pdf_path,
         bundle.source,
         bundle.source.parent.parent.name,
         analysis,
+        overwrite=True,
     )
     state["approved_pdf"] = {
         "path": str(pdf_path),
@@ -1202,8 +1196,6 @@ def review_and_maybe_publish(
     if generate_pdf:
         if not confirmed:
             raise ReviewWorkflowError("ExplicitHumanConfirmationRequired")
-        if output_dir is None:
-            raise ReviewWorkflowError("ApprovedPdfOutputDirectoryRequired")
         pdf_path = generate_approved_pdf(
             bundle,
             state,

@@ -11,7 +11,8 @@ from reportlab.pdfbase.ttfonts import TTFont as ReportLabTTFont
 from pypdf import PdfReader
 
 from app.config import AzureConfig
-from app.file_manager import discover_mp3_files, meeting_datetime, pdf_path_for_source, source_processing_lock
+import app.file_manager as file_manager
+from app.file_manager import discover_mp3_files, meeting_datetime, pdf_path_for_source, resolve_meeting_output_paths, source_processing_lock
 from app.main import process_file, main
 from app.pdf_export import write_pdf
 import app.config as config_module
@@ -60,14 +61,17 @@ def single_audio_chunk(monkeypatch):
     monkeypatch.setattr(AzureOpenAITranscriber, "_probe_duration", staticmethod(lambda _path: 60.0))
 
 
-def test_recursive_discovery_and_adjacent_output_mapping(tmp_path: Path):
+def test_recursive_discovery_and_transcript_output_mapping(tmp_path: Path, monkeypatch):
     root = tmp_path / "input"
-    source = root / "Site" / "Month" / "meeting-20261104-0815.MP3"
+    source = root / "Site" / "Nov26" / "meeting-20261104-0815.MP3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"sample")
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     assert discover_mp3_files(root) == [source]
-    assert pdf_path_for_source(source) == source.with_suffix(".pdf")
-    assert pdf_path_for_source(source).name == "meeting-20261104-0815.pdf"
+    assert pdf_path_for_source(source) == (
+        tmp_path / "Transcript" / "Site" / "Nov26"
+        / "meeting-20261104-0815_Full.pdf"
+    )
 
 
 def test_datetime_parsing():
@@ -75,12 +79,14 @@ def test_datetime_parsing():
     assert meeting_datetime("bad.mp3") is None
 
 
-def test_existing_pdf_is_skipped_without_transcription(tmp_path: Path):
+def test_existing_pdf_is_skipped_without_transcription(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     root = tmp_path / "input"
-    source = root / "Plant" / "Month" / "m.mp3"
+    source = root / "Plant" / "Nov26" / "m.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"audio")
-    pdf = source.with_suffix(".pdf")
+    pdf = resolve_meeting_output_paths(source).full_transcript_pdf
+    pdf.parent.mkdir(parents=True)
     pdf.write_bytes(b"existing")
     transcriber = Mock()
     assert not process_file(source, root, transcriber)
@@ -88,9 +94,10 @@ def test_existing_pdf_is_skipped_without_transcription(tmp_path: Path):
     assert pdf.read_bytes() == b"existing"
 
 
-def test_failed_processing_can_retry(tmp_path: Path):
+def test_failed_processing_can_retry(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     root = tmp_path / "input"
-    source = root / "Plant" / "m.mp3"
+    source = root / "Plant" / "Nov26" / "m.mp3"
     source.parent.mkdir(parents=True)
     original = b"original"
     source.write_bytes(original)
@@ -100,21 +107,27 @@ def test_failed_processing_can_retry(tmp_path: Path):
         process_file(source, root, transcriber)
     assert process_file(source, root, transcriber)
     assert source.read_bytes() == original
-    assert source.with_suffix(".pdf").is_file()
-    assert not source.with_suffix(".txt").exists()
+    paths = resolve_meeting_output_paths(source)
+    assert paths.full_transcript_pdf.is_file()
+    assert paths.transcript_text.is_file()
 
-def test_force_overwrites_existing_pdf_only(tmp_path: Path):
+def test_force_atomically_overwrites_existing_outputs(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     root = tmp_path / "input"
-    source = root / "Plant" / "meeting.mp3"
+    source = root / "Plant" / "Nov26" / "meeting.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"audio")
-    pdf = source.with_suffix(".pdf")
+    pdf = resolve_meeting_output_paths(source).full_transcript_pdf
+    pdf.parent.mkdir(parents=True)
     pdf.write_bytes(b"old pdf")
     transcriber = Mock()
     transcriber.transcribe.return_value = "ข้อความใหม่"
     assert process_file(source, root, transcriber, force=True)
+    paths = resolve_meeting_output_paths(source)
     assert pdf.read_bytes().startswith(b"%PDF")
-    assert not source.with_suffix(".txt").exists()
+    assert paths.transcript_text.read_text(encoding="utf-8") == "ข้อความใหม่"
+    assert source.read_bytes() == b"audio"
+    transcriber.transcribe.assert_called_once_with(source)
 
 
 def test_azure_transcription_uses_mock_and_thai_language(tmp_path: Path, single_audio_chunk):
@@ -304,13 +317,14 @@ def test_atomic_pdf_write_does_not_leave_partial_file(tmp_path: Path):
 
 def test_dry_run_does_not_call_azure(tmp_path: Path, capsys, monkeypatch):
     root = tmp_path / "input"
-    source = root / "Site" / "meeting.mp3"
+    source = root / "Site" / "Nov26" / "meeting.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"audio")
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     monkeypatch.setattr(AzureOpenAITranscriber, "_probe_duration", staticmethod(lambda _path: 200.0))
     assert main(["--input-dir", str(root), "--dry-run"]) == 0
     output = capsys.readouterr().out
-    assert f"{source} -> {source.with_suffix('.pdf')}" in output
+    assert f"{source} -> {pdf_path_for_source(source)}" in output
     assert "chunks=2" in output
 
 
@@ -346,9 +360,10 @@ def test_empty_chunk_fails_instead_of_being_omitted(tmp_path: Path, monkeypatch,
     assert session.post.call_count == 2
 
 
-def test_source_integrity_preserved_during_pdf_processing(tmp_path: Path):
+def test_source_integrity_preserved_during_pdf_processing(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     root = tmp_path / "input"
-    source = root / "Plant" / "Month" / "m.mp3"
+    source = root / "Plant" / "Nov26" / "m.mp3"
     source.parent.mkdir(parents=True)
     original = b"immutable source bytes"
     source.write_bytes(original)
@@ -361,7 +376,7 @@ def test_source_integrity_preserved_during_pdf_processing(tmp_path: Path):
 
 def test_duplicate_processing_is_blocked_by_source_lock(tmp_path: Path):
     root = tmp_path / "input"
-    source = root / "Plant" / "Month" / "meeting.mp3"
+    source = root / "Plant" / "Nov26" / "meeting.mp3"
     source.parent.mkdir(parents=True)
     source.write_bytes(b"audio")
     transcriber = Mock()

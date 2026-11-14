@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import app.auto_scan as auto_scan
+import app.file_manager as file_manager
 from app.meeting_analysis import AnalysisItem, EvidenceReference, MeetingAnalysis
 from app.meeting_outputs import MeetingPdfOutputs, PdfOutputStatus, meeting_pdf_paths
 from app.scanner import ScannedAudio
@@ -26,6 +27,11 @@ def _scanner_item(source: Path, *, status: str, pdf_exists: bool) -> ScannedAudi
 
 
 def _mock_pipeline(monkeypatch, source: Path, *, summary_status="created"):
+    monkeypatch.setattr(
+        file_manager,
+        "DEFAULT_TRANSCRIPT_ROOT",
+        source.parents[2] / "Transcript",
+    )
     monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "test-version")
     monkeypatch.delenv("AZURE_SPEECH_ENDPOINT", raising=False)
     monkeypatch.delenv("AZURE_SPEECH_KEY", raising=False)
@@ -110,13 +116,13 @@ def test_processing_creates_exact_summary_and_full_output_records(tmp_path: Path
     )
 
     assert status == "completed"
-    assert outputs.summary.path.name == "meeting-20261107-0817.pdf"
+    assert outputs.summary.path.name == "meeting-20261107-0817_Summary_Draft.pdf"
     assert outputs.full_transcript.path.name == "meeting-20261107-0817_Full.pdf"
     repository.save_phase9_outputs.assert_called_once_with(21, transcript, analysis, outputs)
     assert repository.complete_file.call_args.kwargs["review_required"] is False
 
 
-def test_existing_summary_is_preserved_while_full_pdf_is_tracked_independently(
+def test_overwritten_summary_is_accepted_as_valid_pipeline_output(
     tmp_path: Path, monkeypatch,
 ):
     root = tmp_path / "input"
@@ -125,10 +131,9 @@ def test_existing_summary_is_preserved_while_full_pdf_is_tracked_independently(
     source.write_bytes(b"fixture audio")
     summary, _full = meeting_pdf_paths(source)
     summary.write_bytes(b"existing summary")
-    original = summary.read_bytes()
     item = _scanner_item(source, status="review_required", pdf_exists=True)
     transcript, analysis, outputs = _mock_pipeline(
-        monkeypatch, source, summary_status="existing"
+        monkeypatch, source, summary_status="overwritten"
     )
     repository = Mock()
     repository.phase9_schema_ready.return_value = True
@@ -144,9 +149,9 @@ def test_existing_summary_is_preserved_while_full_pdf_is_tracked_independently(
         allow_review_required=True,
     )
 
-    assert status == "review_required"
-    assert summary.read_bytes() == original
+    assert status == "completed"
+    assert outputs.summary.status == "overwritten"
     repository.save_phase9_outputs.assert_called_once_with(22, transcript, analysis, outputs)
-    assert repository.complete_file.call_args.kwargs["review_required"] is True
+    assert repository.complete_file.call_args.kwargs["review_required"] is False
     repository.claim_file.assert_called_once()
     assert repository.claim_file.call_args.kwargs["allow_review_required"] is True

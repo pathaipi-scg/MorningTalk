@@ -184,7 +184,7 @@ def _run_controlled_live_test(
     if not confirm_mssql_write:
         raise ValueError("This operation requires explicit --confirm-mssql-write authorization.")
     output_dir.mkdir(parents=True, exist_ok=True)
-    summary_path, full_path = meeting_pdf_paths(source, output_dir)
+    summary_path, full_path = meeting_pdf_paths(source)
     json_path = output_dir / f"{source.stem}.phase9.json"
     if json_path.exists():
         raise FileExistsError("Phase 9 JSON output already exists; choose a new output directory.")
@@ -297,7 +297,6 @@ def _run_controlled_live_test(
             source.relative_to(input_dir).parts[0],
             document,
             analysis,
-            output_dir=output_dir,
         )
         _write_document_json(
             json_path,
@@ -427,10 +426,12 @@ def run_controlled_transcript_resume(
             ):
                 raise RuntimeError("The original Phase 9 JSON does not match the saved SQL transcript.")
 
-        summary_path, full_path = meeting_pdf_paths(source, output_dir)
+        summary_path, full_path = meeting_pdf_paths(source)
         json_path = output_dir / f"{source.stem}.phase9.json"
-        if summary_path.exists() or full_path.exists() or json_path.exists():
-            raise FileExistsError("A resume output already exists; choose a new versioned directory.")
+        if json_path.exists():
+            raise FileExistsError(
+                "A resume metadata file already exists; choose a new versioned directory."
+            )
 
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(exist_ok=False)
@@ -488,7 +489,6 @@ def run_controlled_transcript_resume(
                 source.relative_to(input_dir).parts[0],
                 transcript,
                 analysis,
-                output_dir=output_dir,
             )
             _write_document_json(
                 json_path,
@@ -506,7 +506,7 @@ def run_controlled_transcript_resume(
                 duration / 60, 1 / 60
             ) < config.quality_warning_chars_per_minute
             outputs_validated = all(
-                result.status == "created"
+                result.status in {"created", "overwritten"}
                 for result in (outputs.summary, outputs.full_transcript)
             )
             needs_review = (

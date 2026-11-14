@@ -16,6 +16,7 @@ from app.meeting_analysis import (
     MeetingAnalysisError,
 )
 from app.meeting_outputs import meeting_pdf_paths, write_meeting_pdfs
+import app.file_manager as file_manager
 from app.pdf_export import write_meeting_summary_pdf
 from app.transcript import TranscriptDocument, TranscriptSegment
 
@@ -524,21 +525,25 @@ def test_summary_pdf_paginates_long_thai_text_and_keeps_layout_readable(tmp_path
     assert any("Tahoma" in name or "Sarabun" in name or "Noto" in name for name in font_names)
 
 
-def test_output_paths_follow_exact_basename_rules(tmp_path: Path):
-    source = tmp_path / "meeting-20261107-0817.mp3"
+def test_output_paths_follow_exact_basename_rules(tmp_path: Path, monkeypatch):
+    source = tmp_path / "CB" / "Nov26" / "meeting-20261107-0817.mp3"
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
 
     summary, full = meeting_pdf_paths(source)
 
-    assert summary == tmp_path / "meeting-20261107-0817.pdf"
-    assert full == tmp_path / "meeting-20261107-0817_Full.pdf"
+    assert summary == tmp_path / "Transcript" / "CB" / "Nov26" / "meeting-20261107-0817_Summary_Draft.pdf"
+    assert full == tmp_path / "Transcript" / "CB" / "Nov26" / "meeting-20261107-0817_Full.pdf"
 
 
 def test_summary_and_full_outputs_are_independent_and_existing_files_are_preserved(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ):
-    source = tmp_path / "meeting.mp3"
+    source = tmp_path / "CB" / "Nov26" / "meeting.mp3"
+    source.parent.mkdir(parents=True)
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     source.write_bytes(b"fixture")
     summary, full = meeting_pdf_paths(source)
+    summary.parent.mkdir(parents=True)
     summary.write_bytes(b"existing summary")
     before = summary.read_bytes()
     transcript = TranscriptDocument(
@@ -560,7 +565,7 @@ def test_fixture_pdf_pair_is_marked_as_fixture_and_never_uses_azure(tmp_path: Pa
     from app.phase9 import run_fixture_preview
 
     summary = run_fixture_preview(tmp_path)
-    full = summary.with_name(f"{summary.stem}_Full.pdf")
+    full = summary.with_name(summary.name.replace("_Summary_Draft.pdf", "_Full.pdf"))
     summary_text = "\n".join(
         page.extract_text() or "" for page in PdfReader(str(summary)).pages
     )

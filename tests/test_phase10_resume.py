@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 import app.phase10 as phase10
+import app.file_manager as file_manager
 from app.config import AzureConfig
 from app.file_manager import source_fingerprint
 from app.main import main
@@ -19,8 +20,13 @@ ENDPOINT = (
 
 
 def _fixture(tmp_path: Path, monkeypatch):
-    source = tmp_path / "meeting-20261107-0817.mp3"
+    source = (
+        tmp_path / "Record File" / "CB" / "Nov26"
+        / "meeting-20261107-0817.mp3"
+    )
+    source.parent.mkdir(parents=True)
     source.write_bytes(b"fixture recording")
+    monkeypatch.setattr(file_manager, "DEFAULT_TRANSCRIPT_ROOT", tmp_path / "Transcript")
     segment = TranscriptSegment(
         1.0, 2.0, None, "ตรวจ Encoder Lot 123", "ตรวจ Encoder Lot 123"
     )
@@ -235,6 +241,153 @@ def test_preflight_failure_prevents_any_analysis_request(tmp_path, monkeypatch):
 
     session.post.assert_not_called()
     assert not output_dir.exists()
+
+
+def test_prepared_attempt_saves_raw_response_before_validation(tmp_path, monkeypatch):
+    phase9_json, source, output_dir = _fixture(tmp_path, monkeypatch)
+    prepared = phase10.prepare_analysis_attempt(
+        phase9_json, source, output_dir
+    )
+    request = json.loads(prepared.request_path.read_text(encoding="utf-8"))
+    assert request["status"] == "prepared"
+    assert request["expected_requests"] == 1
+    assert request["automatic_retries"] is False
+    response = _analysis_response()
+    response.content = b'{"retained":"raw response"}'
+
+    def parse_after_raw_saved():
+        assert prepared.raw_response_path.read_bytes() == response.content
+        return response.json.return_value
+
+    response.json.side_effect = parse_after_raw_saved
+    session = Mock()
+    session.post.return_value = response
+    original_phase9 = phase9_json.read_bytes()
+
+    result = phase10.run_analysis_resume(
+        phase9_json,
+        source,
+        prepared.output_dir,
+        session=session,
+        attempt_id=prepared.attempt_id,
+        confirm_azure_request=True,
+    )
+
+    session.post.assert_called_once()
+    assert result.analysis.review_reason == "SemanticReviewRequired"
+    assert result.summary_pdf is None
+    assert phase9_json.read_bytes() == original_phase9
+    saved_request = json.loads(prepared.request_path.read_text(encoding="utf-8"))
+    assert saved_request["status"] == "completed"
+    assert saved_request["input_tokens"] == 10
+    assert saved_request["output_tokens"] == 8
+    saved_analysis = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert saved_analysis["attempt_id"] == prepared.attempt_id
+    assert saved_analysis["meeting_analysis_requests"] == 1
+
+
+def test_prepared_attempt_requires_explicit_live_authorization(tmp_path, monkeypatch):
+    phase9_json, source, output_dir = _fixture(tmp_path, monkeypatch)
+    prepared = phase10.prepare_analysis_attempt(
+        phase9_json, source, output_dir
+    )
+    session = Mock()
+
+    with pytest.raises(
+        phase10.AnalysisResumePreflightError,
+        match="ExplicitAzureAuthorizationRequired",
+    ):
+        phase10.run_analysis_resume(
+            phase9_json,
+            source,
+            prepared.output_dir,
+            session=session,
+            attempt_id=prepared.attempt_id,
+        )
+
+    session.post.assert_not_called()
+    request = json.loads(prepared.request_path.read_text(encoding="utf-8"))
+    assert request["status"] == "prepared"
+
+
+def test_prepared_attempt_preserves_invalid_raw_response_and_blocks_reuse(
+    tmp_path, monkeypatch
+):
+    phase9_json, source, output_dir = _fixture(tmp_path, monkeypatch)
+    prepared = phase10.prepare_analysis_attempt(
+        phase9_json, source, output_dir
+    )
+    response = _analysis_response(valid=False)
+    response.content = b'{"original":"invalid claims preserved"}'
+    session = Mock()
+    session.post.return_value = response
+
+    result = phase10.run_analysis_resume(
+        phase9_json,
+        source,
+        prepared.output_dir,
+        session=session,
+        attempt_id=prepared.attempt_id,
+        confirm_azure_request=True,
+    )
+
+    assert result.analysis.review_reason == "OverviewEvidenceInvalid"
+    assert prepared.raw_response_path.read_bytes() == response.content
+    metadata = json.loads(prepared.request_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "completed"
+    second_session = Mock()
+    with pytest.raises(
+        phase10.AnalysisResumePreflightError,
+        match="PreparedAttemptMismatchOrAlreadyUsed",
+    ):
+        phase10.run_analysis_resume(
+            phase9_json,
+            source,
+            prepared.output_dir,
+            session=second_session,
+            attempt_id=prepared.attempt_id,
+            confirm_azure_request=True,
+        )
+    second_session.post.assert_not_called()
+
+
+def test_prepared_attempt_marks_uncertain_dispatch_and_never_retries(
+    tmp_path, monkeypatch
+):
+    phase9_json, source, output_dir = _fixture(tmp_path, monkeypatch)
+    prepared = phase10.prepare_analysis_attempt(
+        phase9_json, source, output_dir
+    )
+    session = Mock()
+    session.post.side_effect = phase10.requests.exceptions.Timeout
+
+    with pytest.raises(phase10.MeetingAnalysisError):
+        phase10.run_analysis_resume(
+            phase9_json,
+            source,
+            prepared.output_dir,
+            session=session,
+            attempt_id=prepared.attempt_id,
+            confirm_azure_request=True,
+        )
+
+    session.post.assert_called_once()
+    metadata = json.loads(prepared.request_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "unknown"
+    retry_session = Mock()
+    with pytest.raises(
+        phase10.AnalysisResumePreflightError,
+        match="PreparedAttemptMismatchOrAlreadyUsed",
+    ):
+        phase10.run_analysis_resume(
+            phase9_json,
+            source,
+            prepared.output_dir,
+            session=retry_session,
+            attempt_id=prepared.attempt_id,
+            confirm_azure_request=True,
+        )
+    retry_session.post.assert_not_called()
 
 
 def test_cli_requires_explicit_azure_authorization(tmp_path, monkeypatch):

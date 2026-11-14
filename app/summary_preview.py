@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.file_manager import source_fingerprint
+from app.file_manager import resolve_meeting_output_paths, source_fingerprint
 from app.meeting_analysis import EvidenceReference, GPTMeetingAnalyzer, MeetingAnalysis
 from app.pdf_export import write_meeting_summary_pdf
 from app.transcript import TranscriptSegment, validate_segment_times
@@ -20,7 +20,7 @@ class SummaryPreviewNotReady(ValueError):
 def write_sara_summary_preview(
     phase9_json_path: Path,
     source: Path,
-    output_dir: Path,
+    output_dir: Path | None = None,
 ) -> Path:
     try:
         payload = json.loads(phase9_json_path.read_text(encoding="utf-8"))
@@ -113,14 +113,17 @@ def write_sara_summary_preview(
     ):
         raise SummaryPreviewNotReady("SourceFingerprintMismatch")
 
-    output_path = output_dir / f"{source.stem}_SARA_Preview.pdf"
-    if output_path.exists():
-        raise FileExistsError("Summary preview already exists; choose a new output directory.")
+    output_paths = resolve_meeting_output_paths(source)
+    if output_dir is not None and output_dir.resolve() != output_paths.directory.resolve():
+        raise SummaryPreviewNotReady("OutputOutsideTranscriptRoot")
+    output_path = output_paths.summary_draft_pdf
     write_meeting_summary_pdf(
         output_path,
         source,
         source.parent.parent.name,
         analysis,
+        overwrite=True,
+        draft=True,
     )
     return output_path
 
