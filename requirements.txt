@@ -3,3 +3,4 @@ requests>=2.31,<3
 reportlab>=4.0,<5
 pytest>=8.0,<9
 pyodbc>=5.1,<6
+webrtcvad-wheels>=2.0.14,<3
